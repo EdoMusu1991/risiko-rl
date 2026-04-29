@@ -1,0 +1,7 @@
+# Dipendenze per il simulatore RisiKo
+numpy>=1.26
+gymnasium>=0.29
+
+# Le dipendenze RL per il training (installate solo su Colab):
+# sb3-contrib>=2.2  (per MaskablePPO)
+# torch>=2.0
