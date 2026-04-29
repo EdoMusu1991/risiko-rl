@@ -121,26 +121,42 @@ def _bot_random_gioca_turno(
     rng: random.Random,
 ) -> None:
     """
-    Esegue un intero turno per `colore` con strategia random.
-    Stesso bot del test di integrazione, leggermente più conservativo.
+    Esegue un intero turno per `colore` con strategia COMPLETAMENTE RANDOM.
+
+    IMPORTANTE: questo bot deve giocare con la stessa "stupidità" del bot RL
+    quando è random (non addestrato). Altrimenti c'è asimmetria: il bot RL
+    deve battere avversari smart, ma parte da random — partita persa in partenza.
+
+    Strategia uniforme: per ogni decisione, sceglie azione random tra quelle legali.
+    Niente euristiche, niente filtri ratio, niente preferenze di ratio.
     """
     giocatore = stato.giocatori[colore]
+    if not stato.territori_di(colore):
+        return  # eliminato
 
     # ── FASE 1: tris e rinforzi ──────────────────────────────────
+    # Tris: random se giocarli o no
     tris_da_giocare = seleziona_due_tris_disgiunti(giocatore.carte)
-    bonus_tris = calcola_bonus_tris(stato, colore, tris_da_giocare) if tris_da_giocare else 0
-    if tris_da_giocare:
+    bonus_tris = 0
+    if tris_da_giocare and rng.random() < 0.5:
+        bonus_tris = calcola_bonus_tris(stato, colore, tris_da_giocare)
         gioca_tris(stato, colore, tris_da_giocare)
 
     rinf_base = calcola_rinforzi_base(stato, colore)
     bonus_cont = calcola_bonus_continenti(stato, colore)
     totale_rinforzi = rinf_base + bonus_cont + bonus_tris
 
+    # Cap 130 (come fa il bot RL)
+    armate_correnti = stato.num_armate_di(colore)
+    spazio = max(0, 130 - armate_correnti)
+    totale_rinforzi = min(totale_rinforzi, spazio)
+
     territori_propri = stato.territori_di(colore)
     if not territori_propri:
-        return  # eliminato
+        return
 
     if totale_rinforzi > 0:
+        # Distribuzione casuale uniforme sui propri territori
         distribuzione = {}
         for _ in range(totale_rinforzi):
             t = rng.choice(territori_propri)
@@ -148,8 +164,10 @@ def _bot_random_gioca_turno(
         piazza_rinforzi(stato, colore, distribuzione)
 
     # ── FASE 2: attacchi ─────────────────────────────────────────
+    # Numero di attacchi random tra 0 e 3 (era 5 con filtri)
+    # Niente filtro rapporto: attacca anche se sfavorevole
+    max_attacchi = rng.randint(0, 3)
     n_attacchi = 0
-    max_attacchi = 5
     while n_attacchi < max_attacchi and not stato.terminata:
         propri_con_armate = [t for t in stato.territori_di(colore)
                              if stato.mappa[t].armate >= 2]
@@ -163,27 +181,40 @@ def _bot_random_gioca_turno(
             continue
 
         verso = rng.choice(attaccabili)
-        rapporto = stato.mappa[da].armate / max(1, stato.mappa[verso].armate)
-        if rapporto < 1.5:
-            n_attacchi += 1
-            continue
-
+        # NIENTE filtro rapporto >= 1.5: attacca a ratio random
+        # 1 lancio per attacco (come bot RL), poi decide random se continuare
         esito = esegui_attacco(stato, colore, da, verso, rng,
-                              fermati_dopo_lanci=3)
+                              fermati_dopo_lanci=1)
+
+        # 50% di chance di continuare a tirare se non ha conquistato
+        while (not esito.conquistato
+               and not stato.terminata
+               and rng.random() < 0.5
+               and stato.mappa[da].proprietario == colore
+               and stato.mappa[da].armate >= 2
+               and stato.mappa[verso].proprietario != colore):
+            from .motore import attacco_legale
+            if not attacco_legale(stato, colore, da, verso):
+                break
+            esito = esegui_attacco(stato, colore, da, verso, rng,
+                                  fermati_dopo_lanci=1)
+
         if esito.conquistato:
             minimo = esito.num_dadi_ultimo_lancio
             massimo = stato.mappa[da].armate - 1
-            quantita = min(massimo, max(minimo, massimo // 2))
-            fine = applica_conquista(stato, colore, da, verso,
-                                     quantita, esito, rng)
-            if fine:
-                return
+            if minimo <= massimo:
+                # Quantità random tra minimo e massimo
+                quantita = rng.randint(minimo, massimo)
+                fine = applica_conquista(stato, colore, da, verso,
+                                         quantita, esito, rng)
+                if fine:
+                    return
         n_attacchi += 1
         if stato.terminata:
             return
 
-    # ── FASE 3: spostamento (random, 50%) ────────────────────────
-    if rng.random() < 0.5:
+    # ── FASE 3: spostamento (random, 30%) ────────────────────────
+    if rng.random() < 0.3:
         territori_propri = stato.territori_di(colore)
         candidati = []
         for da in territori_propri:
@@ -318,6 +349,10 @@ class RisikoEnv(gym.Env):
             f"Corrente: {self.stato.giocatore_corrente}"
         )
 
+        # Snapshot pre-step per reward shaping
+        n_terr_pre = self.stato.num_territori_di(self.bot_color)
+        n_arm_pre = self.stato.num_armate_di(self.bot_color)
+
         # Esegui l'azione in base alla sotto-fase
         if self.sotto_fase == SottoFase.TRIS:
             self._step_tris(action)
@@ -348,8 +383,22 @@ class RisikoEnv(gym.Env):
         reward = 0.0
         terminated = self.stato.terminata
         truncated = self.step_count >= self.max_steps
+
         if terminated:
             reward = self._calcola_reward_finale()
+        else:
+            # Reward shaping: piccoli incentivi per dare segnale alla rete
+            # NB: magnitudo bassa (0.001-0.01) per non sovrastare il reward terminale (±1)
+            n_terr_post = self.stato.num_territori_di(self.bot_color)
+            n_arm_post = self.stato.num_armate_di(self.bot_color)
+
+            # +0.001 per ogni territorio conquistato in questo step
+            delta_terr = n_terr_post - n_terr_pre
+            if delta_terr > 0:
+                reward += 0.001 * delta_terr
+            elif delta_terr < 0:
+                # Penalty leggermente più piccola per perdita (non vogliamo bot iper-difensivo)
+                reward += 0.0005 * delta_terr  # delta_terr è negativo
 
         obs = self._costruisci_observation()
         info = self._costruisci_info()

@@ -168,24 +168,27 @@ def test_molte_partite_terminano():
 # ═════════════════════════════════════════════════════════════════════════
 
 def test_reward_solo_a_fine_partita():
-    """Reward è 0 durante la partita, solo a fine partita è non-zero."""
+    """Reward intermedio è piccolo (shaping), reward terminale è grande."""
     env = RisikoEnv(seed=42)
     _, info = env.reset()
-    n_zero = 0
-    n_nonzero = 0
+    rewards = []
     while True:
         mask = info["action_mask"]
         legali = np.where(mask)[0]
         azione = random.choice(legali)
         obs, reward, terminated, truncated, info = env.step(int(azione))
-        if reward == 0.0:
-            n_zero += 1
-        else:
-            n_nonzero += 1
+        rewards.append(reward)
         if terminated or truncated:
             break
-    assert n_nonzero <= 1, f"Più di 1 reward non-zero: {n_nonzero}"
-    print(f"✓ Reward sparso: {n_zero} step a 0, {n_nonzero} step finale non-zero")
+    # Il reward terminale deve essere grande (|reward| >= 0.3)
+    assert abs(rewards[-1]) >= 0.3, f"Reward terminale troppo piccolo: {rewards[-1]}"
+    # I reward intermedi devono essere piccoli (shaping)
+    if len(rewards) > 1:
+        max_intermediate = max(abs(r) for r in rewards[:-1])
+        assert max_intermediate < 0.1, (
+            f"Reward intermedio troppo grande: {max_intermediate}"
+        )
+    print(f"✓ Reward shaping: terminale={rewards[-1]}, max intermedio={max([abs(r) for r in rewards[:-1]] + [0]):.4f}")
 
 
 def test_reward_vittoria_max():
