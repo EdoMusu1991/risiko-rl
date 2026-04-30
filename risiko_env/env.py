@@ -307,9 +307,11 @@ class RisikoEnv(gym.Env):
         if terminated:
             reward = self._calcola_reward_finale()
         else:
-            # === REWARD SHAPING v4-test (valori conservativi) ===
-            # Versione "test" per validare prima di scalare il training.
-            # Magnitudo intermedie fra v3 (troppo debole) e v4-aggressivo (rischio bias).
+            # === REWARD SHAPING v4.1-test (anti-stallo aggiunto) ===
+            # v4.1 = v4-test + penalty mirata per cap-bound stagnation.
+            # v4-test ha risolto il "Peru collapse" ma ha lasciato uno stallo
+            # conservativo (bot fermo a cap 130 per round). v4.1 aggiunge una
+            # penalty -0.001 specifica a quel scenario.
 
             n_terr_post = self.stato.num_territori_di(self.bot_color)
             n_continenti_post = self._conta_continenti(self.bot_color)
@@ -338,6 +340,15 @@ class RisikoEnv(gym.Env):
             # Penalty -0.0005 per turno passivo (era 0.005 in v4 — troppo aggressivo)
             if turno_appena_finito and delta_terr == 0 and delta_terr_obj == 0:
                 reward -= 0.0005
+
+            # === v4.1: PENALTY ANTI-STALLO MIRATA ===
+            # Si attiva solo se cap di armate quasi raggiunto E nessuna conquista.
+            # Il problema osservato in v4-test era: bot a 129 armate fermo per 20 round.
+            # Penalty leggera (-0.001) per spingere a usare le armate accumulate.
+            if (turno_appena_finito
+                    and self.stato.num_armate_di(self.bot_color) >= 125
+                    and delta_terr <= 0):
+                reward -= 0.001
 
         obs = self._costruisci_observation()
         info = self._costruisci_info()
