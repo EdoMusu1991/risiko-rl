@@ -64,14 +64,16 @@ def test_dimensione_observation():
 
 def test_dimensione_componenti():
     """Verifica che la somma delle componenti = DIM_OBSERVATION."""
+    from risiko_env.encoding import DIM_OPPONENT_PROFILE
     somma = (DIM_MAPPA + DIM_OBIETTIVO_PROPRIO + DIM_CARTE_PROPRIE
              + DIM_AVVERSARI + DIM_CONTROLLO_CONTINENTI
-             + DIM_FASE_E_TURNO + DIM_TRIS_GIOCATI)
+             + DIM_FASE_E_TURNO + DIM_TRIS_GIOCATI + DIM_OPPONENT_PROFILE)
     assert somma == DIM_OBSERVATION, f"Somma {somma} != {DIM_OBSERVATION}"
     print(f"✓ Componenti: mappa={DIM_MAPPA}, obj={DIM_OBIETTIVO_PROPRIO}, "
           f"carte={DIM_CARTE_PROPRIE}, avv={DIM_AVVERSARI}, "
           f"cont={DIM_CONTROLLO_CONTINENTI}, fase={DIM_FASE_E_TURNO}, "
-          f"tris={DIM_TRIS_GIOCATI}, totale={DIM_OBSERVATION}")
+          f"tris={DIM_TRIS_GIOCATI}, opp_profile={DIM_OPPONENT_PROFILE}, "
+          f"totale={DIM_OBSERVATION}")
 
 
 def test_dimensione_costante_su_seed_diversi():

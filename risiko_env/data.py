@@ -442,10 +442,10 @@ def limite_continente_distribuzione(continente: str) -> int:
 
 # Distribuzione territori al setup (vedi specifica 3.1)
 TERRITORI_PER_GIOCATORE = {
-    "BLU": 11,
-    "ROSSO": 11,
-    "VERDE": 10,
-    "GIALLO": 10,
+    "BLU": 10,
+    "ROSSO": 10,
+    "VERDE": 11,
+    "GIALLO": 11,
 }
 
 # Carri da piazzare nei 7 round di piazzamento iniziale (vedi specifica 3.3)

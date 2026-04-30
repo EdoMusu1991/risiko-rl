@@ -50,6 +50,7 @@ from .encoding import (
     codifica_osservazione,
     DIM_OBSERVATION,
     INDEX_TERRITORIO,
+    get_dim_observation,
 )
 from .azioni import (
     NUM_AZIONI_TRIS,
@@ -71,6 +72,11 @@ from .azioni import (
     decodifica_azione_attacco,
     decodifica_azione_spostamento,
 )
+
+# Moduli estratti durante il refactoring
+from .bot_random import gioca_turno_random
+from .opponent_tracker import OpponentTracker
+from .event_log import EventLogger
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -112,132 +118,6 @@ REWARD_PER_POSIZIONE = {
 
 
 # ═════════════════════════════════════════════════════════════════════════
-#  BOT RANDOM (per gli avversari)
-# ═════════════════════════════════════════════════════════════════════════
-
-def _bot_random_gioca_turno(
-    stato: StatoPartita,
-    colore: str,
-    rng: random.Random,
-) -> None:
-    """
-    Esegue un intero turno per `colore` con strategia COMPLETAMENTE RANDOM.
-
-    IMPORTANTE: questo bot deve giocare con la stessa "stupidità" del bot RL
-    quando è random (non addestrato). Altrimenti c'è asimmetria: il bot RL
-    deve battere avversari smart, ma parte da random — partita persa in partenza.
-
-    Strategia uniforme: per ogni decisione, sceglie azione random tra quelle legali.
-    Niente euristiche, niente filtri ratio, niente preferenze di ratio.
-    """
-    giocatore = stato.giocatori[colore]
-    if not stato.territori_di(colore):
-        return  # eliminato
-
-    # ── FASE 1: tris e rinforzi ──────────────────────────────────
-    # Tris: random se giocarli o no
-    tris_da_giocare = seleziona_due_tris_disgiunti(giocatore.carte)
-    bonus_tris = 0
-    if tris_da_giocare and rng.random() < 0.5:
-        bonus_tris = calcola_bonus_tris(stato, colore, tris_da_giocare)
-        gioca_tris(stato, colore, tris_da_giocare)
-
-    rinf_base = calcola_rinforzi_base(stato, colore)
-    bonus_cont = calcola_bonus_continenti(stato, colore)
-    totale_rinforzi = rinf_base + bonus_cont + bonus_tris
-
-    # Cap 130 (come fa il bot RL)
-    armate_correnti = stato.num_armate_di(colore)
-    spazio = max(0, 130 - armate_correnti)
-    totale_rinforzi = min(totale_rinforzi, spazio)
-
-    territori_propri = stato.territori_di(colore)
-    if not territori_propri:
-        return
-
-    if totale_rinforzi > 0:
-        # Distribuzione casuale uniforme sui propri territori
-        distribuzione = {}
-        for _ in range(totale_rinforzi):
-            t = rng.choice(territori_propri)
-            distribuzione[t] = distribuzione.get(t, 0) + 1
-        piazza_rinforzi(stato, colore, distribuzione)
-
-    # ── FASE 2: attacchi ─────────────────────────────────────────
-    # Numero di attacchi random tra 0 e 3 (era 5 con filtri)
-    # Niente filtro rapporto: attacca anche se sfavorevole
-    max_attacchi = rng.randint(0, 3)
-    n_attacchi = 0
-    while n_attacchi < max_attacchi and not stato.terminata:
-        propri_con_armate = [t for t in stato.territori_di(colore)
-                             if stato.mappa[t].armate >= 2]
-        if not propri_con_armate:
-            break
-
-        da = rng.choice(propri_con_armate)
-        attaccabili = territori_attaccabili_da(stato, da)
-        if not attaccabili:
-            n_attacchi += 1
-            continue
-
-        verso = rng.choice(attaccabili)
-        # NIENTE filtro rapporto >= 1.5: attacca a ratio random
-        # 1 lancio per attacco (come bot RL), poi decide random se continuare
-        esito = esegui_attacco(stato, colore, da, verso, rng,
-                              fermati_dopo_lanci=1)
-
-        # 50% di chance di continuare a tirare se non ha conquistato
-        while (not esito.conquistato
-               and not stato.terminata
-               and rng.random() < 0.5
-               and stato.mappa[da].proprietario == colore
-               and stato.mappa[da].armate >= 2
-               and stato.mappa[verso].proprietario != colore):
-            from .motore import attacco_legale
-            if not attacco_legale(stato, colore, da, verso):
-                break
-            esito = esegui_attacco(stato, colore, da, verso, rng,
-                                  fermati_dopo_lanci=1)
-
-        if esito.conquistato:
-            minimo = esito.num_dadi_ultimo_lancio
-            massimo = stato.mappa[da].armate - 1
-            if minimo <= massimo:
-                # Quantità random tra minimo e massimo
-                quantita = rng.randint(minimo, massimo)
-                fine = applica_conquista(stato, colore, da, verso,
-                                         quantita, esito, rng)
-                if fine:
-                    return
-        n_attacchi += 1
-        if stato.terminata:
-            return
-
-    # ── FASE 3: spostamento (random, 30%) ────────────────────────
-    if rng.random() < 0.3:
-        territori_propri = stato.territori_di(colore)
-        candidati = []
-        for da in territori_propri:
-            if stato.mappa[da].armate < 3:
-                continue
-            for verso in ADIACENZE[da]:
-                if stato.mappa[verso].proprietario == colore:
-                    candidati.append((da, verso))
-        if candidati:
-            da, verso = rng.choice(candidati)
-            from .motore import _minimo_da_lasciare_per_spostamento
-            min_da_lasciare = _minimo_da_lasciare_per_spostamento(stato, da, colore)
-            massimo = stato.mappa[da].armate - min_da_lasciare
-            if massimo >= 1:
-                quantita = rng.randint(1, massimo)
-                if spostamento_legale(stato, colore, da, verso, quantita):
-                    esegui_spostamento(stato, colore, da, verso, quantita)
-
-    # ── FASE 4: pesca carta ──────────────────────────────────────
-    pesca_carta(stato, colore, rng)
-
-
-# ═════════════════════════════════════════════════════════════════════════
 #  ENVIRONMENT GYMNASIUM
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -265,22 +145,32 @@ class RisikoEnv(gym.Env):
         bot_color: str = "BLU",
         max_steps: int = 5000,
         seed: Optional[int] = None,
+        log_eventi: bool = False,
     ):
         """
         Args:
             bot_color: colore controllato dal bot RL
             max_steps: limite step per partita (failsafe contro loop)
             seed: per riproducibilità
+            log_eventi: se True, registra eventi della partita in self._eventi
+                (per visualizzazione/replay). Spegne in training (overhead).
         """
         super().__init__()
         assert bot_color in COLORI_GIOCATORI, f"Colore invalido: {bot_color}"
         self.bot_color = bot_color
         self.max_steps = max_steps
         self._initial_seed = seed
+        self.log_eventi = log_eventi
+
+        # Componenti modulari (estratti durante refactoring)
+        self._tracker = OpponentTracker(bot_color=self.bot_color)
+        self._logger = EventLogger(attivo=log_eventi)
 
         # Spazi Gymnasium
+        # Dimensione dinamica: dipende da STAGE_A_ATTIVO (retrocompat)
+        dim_obs = get_dim_observation()
         self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(DIM_OBSERVATION,), dtype=np.float32
+            low=0.0, high=1.0, shape=(dim_obs,), dtype=np.float32
         )
         self.action_space = spaces.Discrete(ACTION_SPACE_SIZE)
 
@@ -296,6 +186,26 @@ class RisikoEnv(gym.Env):
         self._attacco_corrente: Optional[tuple[str, str]] = None  # (da, verso) attacco in corso
         self._esito_attacco_corrente: Optional[EsitoAttacco] = None  # esito ultimo lancio
         self._spostamento_corrente: Optional[tuple[str, str]] = None  # (da, verso) spostamento
+
+    # Proprietà legacy: facade verso i nuovi componenti.
+    # Serve per backward-compat con codice esterno (tests, tools).
+    @property
+    def _storia_mosse(self) -> dict:
+        """Storia mosse degli avversari (delegata a OpponentTracker)."""
+        return self._tracker.storia
+
+    @_storia_mosse.setter
+    def _storia_mosse(self, value: dict) -> None:
+        self._tracker.storia = value
+
+    @property
+    def _eventi(self) -> list:
+        """Lista eventi (delegata a EventLogger)."""
+        return self._logger.eventi
+
+    @_eventi.setter
+    def _eventi(self, value: list) -> None:
+        self._logger.eventi = value
 
     # ─────────────────────────────────────────────────────────────
     #  RESET
@@ -322,6 +232,10 @@ class RisikoEnv(gym.Env):
         self._attacco_corrente = None
         self._esito_attacco_corrente = None
         self._spostamento_corrente = None
+
+        # Reset componenti modulari
+        self._tracker.reset()
+        self._logger.reset()
 
         # Avanza fino al primo turno del bot
         self._avanza_fino_a_turno_bot()
@@ -352,6 +266,10 @@ class RisikoEnv(gym.Env):
         # Snapshot pre-step per reward shaping
         n_terr_pre = self.stato.num_territori_di(self.bot_color)
         n_arm_pre = self.stato.num_armate_di(self.bot_color)
+        n_continenti_pre = self._conta_continenti(self.bot_color)
+        n_terr_obj_pre = self._conta_territori_in_obiettivo(self.bot_color)
+        sotto_fase_pre = self.sotto_fase
+        turno_finito_pre = (self.sotto_fase is None)
 
         # Esegui l'azione in base alla sotto-fase
         if self.sotto_fase == SottoFase.TRIS:
@@ -372,8 +290,10 @@ class RisikoEnv(gym.Env):
             raise RuntimeError(f"Sotto-fase invalida: {self.sotto_fase}")
 
         # Se la partita è terminata o il bot ha finito il turno, fa girare gli altri
+        turno_appena_finito = False
         if not self.stato.terminata:
             if self.sotto_fase is None:
+                turno_appena_finito = True
                 # Il bot ha finito il turno → vai al prossimo turno (altri o bot)
                 self._fine_turno_bot()
                 if not self.stato.terminata:
@@ -387,23 +307,56 @@ class RisikoEnv(gym.Env):
         if terminated:
             reward = self._calcola_reward_finale()
         else:
-            # Reward shaping: piccoli incentivi per dare segnale alla rete
-            # NB: magnitudo bassa (0.001-0.01) per non sovrastare il reward terminale (±1)
-            n_terr_post = self.stato.num_territori_di(self.bot_color)
-            n_arm_post = self.stato.num_armate_di(self.bot_color)
+            # === REWARD SHAPING v4-test (valori conservativi) ===
+            # Versione "test" per validare prima di scalare il training.
+            # Magnitudo intermedie fra v3 (troppo debole) e v4-aggressivo (rischio bias).
 
-            # +0.001 per ogni territorio conquistato in questo step
+            n_terr_post = self.stato.num_territori_di(self.bot_color)
+            n_continenti_post = self._conta_continenti(self.bot_color)
+            n_terr_obj_post = self._conta_territori_in_obiettivo(self.bot_color)
+
+            # +0.003 per territorio conquistato (era 0.001 in v3, 0.005 in v4)
             delta_terr = n_terr_post - n_terr_pre
             if delta_terr > 0:
-                reward += 0.001 * delta_terr
+                reward += 0.003 * delta_terr
             elif delta_terr < 0:
-                # Penalty leggermente più piccola per perdita (non vogliamo bot iper-difensivo)
-                reward += 0.0005 * delta_terr  # delta_terr è negativo
+                # Penalty -0.0015 per territorio perso (era 0.0005 in v3, 0.002 in v4)
+                reward += 0.0015 * delta_terr  # negativo
+
+            # +0.03 per continente completato (era 0.05 in v4 — rischio continent farming)
+            delta_continenti = n_continenti_post - n_continenti_pre
+            if delta_continenti > 0:
+                reward += 0.03 * delta_continenti
+            elif delta_continenti < 0:
+                reward += 0.015 * delta_continenti  # negativo
+
+            # +0.001 per territorio in obiettivo conquistato
+            delta_terr_obj = n_terr_obj_post - n_terr_obj_pre
+            if delta_terr_obj > 0:
+                reward += 0.001 * delta_terr_obj
+
+            # Penalty -0.0005 per turno passivo (era 0.005 in v4 — troppo aggressivo)
+            if turno_appena_finito and delta_terr == 0 and delta_terr_obj == 0:
+                reward -= 0.0005
 
         obs = self._costruisci_observation()
         info = self._costruisci_info()
 
         return obs, reward, terminated, truncated, info
+
+    def _conta_continenti(self, colore: str) -> int:
+        """Conta quanti continenti possiede il giocatore."""
+        from .data import CONTINENTI
+        return sum(
+            1 for cont, terrs in CONTINENTI.items()
+            if all(self.stato.mappa[t].proprietario == colore for t in terrs)
+        )
+
+    def _conta_territori_in_obiettivo(self, colore: str) -> int:
+        """Conta quanti territori in obiettivo possiede il giocatore."""
+        from .obiettivi import calcola_punti_in_obiettivo
+        # Usa la funzione esistente: punti = territori in obiettivo
+        return calcola_punti_in_obiettivo(self.stato, colore)
 
     # ─────────────────────────────────────────────────────────────
     #  FLUSSO TURNO BOT
@@ -430,23 +383,85 @@ class RisikoEnv(gym.Env):
                 break
 
             # Turno di un avversario: bot random
-            _bot_random_gioca_turno(self.stato, corrente, self.rng)
+            # STAGE A: snapshot pre-turno per tracking opponent profile
+            snapshot_pre = self._snapshot_per_storia(corrente)
+
+            gioca_turno_random(self.stato, corrente, self.rng)
             if self.stato.terminata:
+                # Registra comunque la mossa (con dati parziali) e termina
+                self._registra_mossa(corrente, snapshot_pre)
                 break
             gestisci_fine_turno(self.stato, corrente, self.rng)
             if self.stato.terminata:
+                self._registra_mossa(corrente, snapshot_pre)
                 break
+
+            # STAGE A: registra la mossa nello storico
+            self._registra_mossa(corrente, snapshot_pre)
+
             avanza_turno(self.stato)
+
+    def _snapshot_per_storia(self, colore: str) -> dict:
+        """Snapshot pre-turno avversario (delegato a OpponentTracker)."""
+        return self._tracker.snapshot_pre_turno(self.stato, colore)
+
+    def _log(self, tipo: str, **dati) -> None:
+        """Registra un evento (delegato a EventLogger)."""
+        self._logger.log(
+            tipo,
+            round=self.stato.round_corrente if self.stato else 0,
+            turno_di=self.stato.giocatore_corrente if self.stato else None,
+            **dati,
+        )
+
+    def _registra_mossa(self, colore: str, snapshot_pre: dict) -> None:
+        """Registra una mossa avversario (delegato a OpponentTracker)."""
+        self._tracker.registra_mossa(
+            self.stato, colore, snapshot_pre,
+            log_callback=self._log if self.log_eventi else None,
+        )
 
     def _fine_turno_bot(self) -> None:
         """
         Chiamato quando il bot ha finito le sue 4 fasi.
         Esegue pesca carta + sdadata + avanza al prossimo turno.
         """
+        # Snapshot pre-pesca per capire se ha pescato
+        n_carte_pre = self.stato.giocatori[self.bot_color].num_carte()
+
         # Pesca carta (se conquistato)
         pesca_carta(self.stato, self.bot_color, self.rng)
+
+        n_carte_post = self.stato.giocatori[self.bot_color].num_carte()
+        if self.log_eventi and n_carte_post > n_carte_pre:
+            self._log("carta_pescata", colore=self.bot_color, n_carte=n_carte_post)
+
+        # Snapshot pre-sdadata
+        territori_pre_sdadata = {
+            c: self.stato.num_territori_di(c) for c in COLORI_GIOCATORI
+        }
+        round_pre = self.stato.round_corrente
+
         # Sdadata e cap di sicurezza
         gestisci_fine_turno(self.stato, self.bot_color, self.rng)
+
+        # Log sdadata se ha cambiato qualcosa
+        if self.log_eventi:
+            territori_post = {
+                c: self.stato.num_territori_di(c) for c in COLORI_GIOCATORI
+            }
+            armate_redistribuite = any(
+                territori_pre_sdadata[c] != territori_post[c]
+                for c in COLORI_GIOCATORI
+            )
+            if armate_redistribuite or self.stato.terminata:
+                self._log(
+                    "sdadata_o_cap",
+                    round=round_pre,
+                    terminata=self.stato.terminata,
+                    motivo_fine=self.stato.motivo_fine,
+                )
+
         if not self.stato.terminata:
             avanza_turno(self.stato)
 
@@ -482,6 +497,18 @@ class RisikoEnv(gym.Env):
         spazio = max(0, 130 - armate_correnti)
         self._rinforzi_rimasti = min(self._rinforzi_rimasti, spazio)
 
+        # Log evento tris+rinforzi base
+        if self.log_eventi:
+            self._log(
+                "tris_e_calcolo_rinforzi",
+                tris_giocato=bool(scelta),
+                num_tris=len(scelta) if scelta else 0,
+                bonus_tris=bonus_tris,
+                rinforzi_base=rinf_base,
+                bonus_continenti=bonus_cont,
+                totale_rinforzi=self._rinforzi_rimasti,
+            )
+
         if self._rinforzi_rimasti > 0:
             self.sotto_fase = SottoFase.RINFORZO
         else:
@@ -508,11 +535,27 @@ class RisikoEnv(gym.Env):
                 return
             territorio = propri[0]
 
+        # Inizializza tracker rinforzi se non esiste
+        if self.log_eventi and not hasattr(self, '_rinforzi_correnti'):
+            self._rinforzi_correnti = {}
+
         # Piazza 1 armata
         piazza_rinforzi(self.stato, self.bot_color, {territorio: 1})
         self._rinforzi_rimasti -= 1
 
+        # Registra rinforzo
+        if self.log_eventi:
+            self._rinforzi_correnti[territorio] = self._rinforzi_correnti.get(territorio, 0) + 1
+
         if self._rinforzi_rimasti <= 0:
+            # Log evento aggregato a fine fase
+            if self.log_eventi and self._rinforzi_correnti:
+                self._log(
+                    "rinforzo_bot",
+                    distribuzione=dict(self._rinforzi_correnti),
+                    totale=sum(self._rinforzi_correnti.values()),
+                )
+                self._rinforzi_correnti = {}
             self.sotto_fase = SottoFase.ATTACCO
 
     # ─────────────────────────────────────────────────────────────
@@ -538,12 +581,30 @@ class RisikoEnv(gym.Env):
             self.sotto_fase = SottoFase.SPOSTAMENTO
             return
 
+        # Snapshot per log: armate prima del lancio
+        armate_da_pre = self.stato.mappa[da].armate
+        armate_verso_pre = self.stato.mappa[verso].armate
+        proprietario_verso_pre = self.stato.mappa[verso].proprietario
+
         # Esegui un singolo lancio di dadi
         self._attacco_corrente = (da, verso)
         self._esito_attacco_corrente = esegui_attacco(
             self.stato, self.bot_color, da, verso, self.rng,
             fermati_dopo_lanci=1,
         )
+
+        # Log evento
+        if self.log_eventi:
+            self._log(
+                "attacco_bot",
+                da=da, verso=verso,
+                armate_da_pre=armate_da_pre,
+                armate_verso_pre=armate_verso_pre,
+                vittima=proprietario_verso_pre,
+                conquistato=self._esito_attacco_corrente.conquistato,
+                armate_da_post=self.stato.mappa[da].armate,
+                armate_verso_post=self.stato.mappa[verso].armate,
+            )
 
         if self._esito_attacco_corrente.conquistato:
             # Conquista! Il bot deve scegliere quante armate spostare
@@ -681,6 +742,11 @@ class RisikoEnv(gym.Env):
 
         if spostamento_legale(self.stato, self.bot_color, da, verso, quantita):
             esegui_spostamento(self.stato, self.bot_color, da, verso, quantita)
+            if self.log_eventi:
+                self._log(
+                    "spostamento_bot",
+                    da=da, verso=verso, quantita=quantita,
+                )
 
         self._spostamento_corrente = None
         self.sotto_fase = None  # turno finito
@@ -692,10 +758,13 @@ class RisikoEnv(gym.Env):
     def _costruisci_observation(self) -> np.ndarray:
         """Costruisce l'observation dal POV del bot."""
         if self.stato is None:
-            return np.zeros(DIM_OBSERVATION, dtype=np.float32)
+            return np.zeros(get_dim_observation(), dtype=np.float32)
 
         fase_corrente = self._fase_corrente_per_encoding()
-        return codifica_osservazione(self.stato, self.bot_color, fase_corrente)
+        return codifica_osservazione(
+            self.stato, self.bot_color, fase_corrente,
+            storia_mosse=self._storia_mosse,
+        )
 
     def _fase_corrente_per_encoding(self) -> str:
         """Mappa sotto-fase → fase principale (per encoding)."""
@@ -792,6 +861,10 @@ class RisikoEnv(gym.Env):
         """
         Reward sparso a fine partita basato sulla posizione del bot.
         +1 se vince, -1 se eliminato, valori intermedi per posizioni intermedie.
+
+        IMPORTANTE: usa gli STESSI 3 criteri di determina_vincitore per
+        ordinare i giocatori (punti obiettivo > punti fuori > ordine inverso).
+        Altrimenti il reward sarebbe inconsistente con il vincitore reale.
         """
         if self.stato.vincitore == self.bot_color:
             return REWARD_PER_POSIZIONE[1]
@@ -800,16 +873,29 @@ class RisikoEnv(gym.Env):
         if not self.stato.giocatori[self.bot_color].vivo:
             return REWARD_PER_POSIZIONE[4]
 
-        # Calcola posizione finale tra giocatori vivi (per punti in obiettivo)
-        from .obiettivi import calcola_punti_in_obiettivo
-        punti = {
-            col: calcola_punti_in_obiettivo(self.stato, col)
-            for col in COLORI_GIOCATORI
-            if self.stato.giocatori[col].vivo
-        }
-        # Ordina decrescente per punti
-        ordinati = sorted(punti.items(), key=lambda x: x[1], reverse=True)
-        for posizione, (col, _) in enumerate(ordinati, start=1):
+        # Calcola posizione finale tra giocatori vivi usando i 3 criteri ufficiali
+        from .obiettivi import (
+            calcola_punti_in_obiettivo,
+            calcola_punti_fuori_obiettivo,
+            ORDINE_MANO_INVERSO,
+        )
+
+        candidati = [c for c in COLORI_GIOCATORI
+                     if self.stato.giocatori[c].vivo]
+
+        # Ordino con chiave composta dei 3 criteri (decrescente):
+        #   1. punti in obiettivo (alto = meglio)
+        #   2. punti fuori obiettivo (alto = meglio)
+        #   3. ordine di mano inverso (Giallo=4 > Verde=3 > Rosso=2 > Blu=1)
+        def chiave_ordinamento(col: str):
+            return (
+                calcola_punti_in_obiettivo(self.stato, col),
+                calcola_punti_fuori_obiettivo(self.stato, col),
+                ORDINE_MANO_INVERSO[col],
+            )
+
+        ordinati = sorted(candidati, key=chiave_ordinamento, reverse=True)
+        for posizione, col in enumerate(ordinati, start=1):
             if col == self.bot_color:
                 return REWARD_PER_POSIZIONE.get(posizione, 0.0)
         return 0.0

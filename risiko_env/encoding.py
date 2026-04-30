@@ -47,7 +47,39 @@ DIM_CONTROLLO_CONTINENTI = NUM_CONTINENTI * NUM_GIOCATORI  # chi controlla ogni 
 DIM_FASE_E_TURNO = 6  # [round_norm, fase_one_hot(4), conquiste_turno_norm]
 DIM_TRIS_GIOCATI = 3  # numero di tris giocati nella partita per ogni simbolo (info pubblica)
 
-# Totale features observation
+# Stage A: opponent profile (4 feature × 3 avversari)
+# Per ogni avversario, calcolate sulle ultime FINESTRA_OPPONENT_PROFILE mosse:
+#   - aggressivita: % turni con almeno un attacco (0-1)
+#   - focus_su_di_me: % attacchi diretti contro POV (0-1)
+#   - risk_tolerance: ratio medio armate attaccante/difensore (normalizzato 0-1)
+#   - expansion_rate: territori conquistati per turno giocato (normalizzato 0-1)
+DIM_OPPONENT_PROFILE = (NUM_GIOCATORI - 1) * 4  # 12
+
+# Finestra temporale per il profilo (ultimi N turni di ogni avversario)
+FINESTRA_OPPONENT_PROFILE = 8
+
+# Stage A può essere disabilitato per retrocompatibilità con modelli vecchi (318 feature)
+# Variabile globale modificabile a runtime
+STAGE_A_ATTIVO = True
+
+
+def get_dim_observation() -> int:
+    """Dimensione observation corrente (dipende da STAGE_A_ATTIVO)."""
+    base = (
+        DIM_MAPPA
+        + DIM_OBIETTIVO_PROPRIO
+        + DIM_CARTE_PROPRIE
+        + DIM_AVVERSARI
+        + DIM_CONTROLLO_CONTINENTI
+        + DIM_FASE_E_TURNO
+        + DIM_TRIS_GIOCATI
+    )
+    if STAGE_A_ATTIVO:
+        base += DIM_OPPONENT_PROFILE
+    return base
+
+
+# Totale features observation (vale a import-time)
 DIM_OBSERVATION = (
     DIM_MAPPA
     + DIM_OBIETTIVO_PROPRIO
@@ -56,6 +88,7 @@ DIM_OBSERVATION = (
     + DIM_CONTROLLO_CONTINENTI
     + DIM_FASE_E_TURNO
     + DIM_TRIS_GIOCATI
+    + DIM_OPPONENT_PROFILE
 )
 
 
@@ -83,6 +116,7 @@ def codifica_osservazione(
     stato: StatoPartita,
     colore_pov: str,
     fase_corrente: str = "TRIS_E_RINFORZI",
+    storia_mosse: dict | None = None,
 ) -> np.ndarray:
     """
     Codifica lo stato della partita dal punto di vista del giocatore `colore_pov`.
@@ -91,6 +125,9 @@ def codifica_osservazione(
         stato: stato corrente della partita
         colore_pov: di chi è la vista (es. "BLU"). Vede solo le info che gli spettano.
         fase_corrente: quale sotto-fase del turno è in corso (per encoding)
+        storia_mosse: dict opzionale {colore: [mossa, ...]} dove ogni mossa è
+            un dict con keys: 'turno', 'attaccato', 'attacchi_contro_pov',
+            'territori_conquistati', 'ratio_medio'. Se None, opponent profile = 0.
 
     Restituisce un np.ndarray di dimensione DIM_OBSERVATION (float32).
     """
@@ -117,9 +154,15 @@ def codifica_osservazione(
     # 7. Tris pubblicamente giocati nella partita (info da pila scarti)
     parti.append(_codifica_tris_giocati(stato))
 
+    # 8. STAGE A: Opponent profile (ultime mosse di ogni avversario)
+    # Solo se STAGE_A_ATTIVO=True (retrocompat con modelli vecchi)
+    if STAGE_A_ATTIVO:
+        parti.append(_codifica_opponent_profile(stato, colore_pov, storia_mosse))
+
     obs = np.concatenate(parti).astype(np.float32)
-    assert len(obs) == DIM_OBSERVATION, (
-        f"Dimensione observation errata: {len(obs)} vs atteso {DIM_OBSERVATION}"
+    dim_attesa = get_dim_observation()
+    assert len(obs) == dim_attesa, (
+        f"Dimensione observation errata: {len(obs)} vs atteso {dim_attesa}"
     )
     return obs
 
@@ -270,3 +313,78 @@ def _codifica_tris_giocati(stato: StatoPartita) -> np.ndarray:
     n_cannoni = sum(1 for c in stato.pila_scarti if c.simbolo == CANNONE) / 14.0
     n_cavalli = sum(1 for c in stato.pila_scarti if c.simbolo == CAVALLO) / 14.0
     return np.array([n_fanti, n_cannoni, n_cavalli], dtype=np.float32)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  STAGE A: OPPONENT PROFILE
+# ─────────────────────────────────────────────────────────────────────────
+
+def _codifica_opponent_profile(
+    stato: StatoPartita,
+    colore_pov: str,
+    storia_mosse: dict | None,
+) -> np.ndarray:
+    """
+    Per ogni avversario, calcola 4 feature sulle ultime FINESTRA_OPPONENT_PROFILE mosse:
+
+    1. aggressivita    — % turni in cui ha attaccato almeno una volta (0-1)
+    2. focus_su_di_me  — % attacchi diretti contro POV (0-1)
+    3. risk_tolerance  — ratio medio armate attaccante/difensore (clip a [0.5, 3.0], norm)
+    4. expansion_rate  — territori netti conquistati per turno giocato (clip [0, 5], norm)
+
+    Se storia_mosse è None o avversario senza storia, restituisce zeri.
+
+    Ordine: avversari ordinati per indice colore (escluso POV).
+    Output: np.ndarray shape (12,) = 4 feature × 3 avversari.
+    """
+    parti = []
+    pov_idx = COLORE_INDEX[colore_pov]
+    avversari = [c for c in COLORI_GIOCATORI if c != colore_pov]
+
+    for avv in avversari:
+        if storia_mosse is None or avv not in storia_mosse or not storia_mosse[avv]:
+            # Nessuna storia: profile a zero
+            parti.append(np.zeros(4, dtype=np.float32))
+            continue
+
+        # Prendi le ultime FINESTRA mosse
+        mosse_recenti = list(storia_mosse[avv])[-FINESTRA_OPPONENT_PROFILE:]
+        n_turni = len(mosse_recenti)
+
+        if n_turni == 0:
+            parti.append(np.zeros(4, dtype=np.float32))
+            continue
+
+        # 1. Aggressività: % turni con almeno un attacco
+        n_turni_aggressivi = sum(1 for m in mosse_recenti if m.get('attaccato', False))
+        aggressivita = n_turni_aggressivi / n_turni
+
+        # 2. Focus su POV: rapporto attacchi-contro-pov / attacchi-totali
+        attacchi_totali = sum(m.get('num_attacchi', 0) for m in mosse_recenti)
+        attacchi_contro_pov = sum(m.get('attacchi_contro_pov', 0) for m in mosse_recenti)
+        if attacchi_totali > 0:
+            focus_su_di_me = attacchi_contro_pov / attacchi_totali
+        else:
+            focus_su_di_me = 0.0
+
+        # 3. Risk tolerance: ratio medio
+        ratios = [m.get('ratio_medio', 0.0) for m in mosse_recenti
+                  if m.get('ratio_medio', 0.0) > 0]
+        if ratios:
+            ratio_medio = sum(ratios) / len(ratios)
+            # Normalizza: clip [0.5, 3.0] → [0, 1]
+            risk_tolerance = (min(3.0, max(0.5, ratio_medio)) - 0.5) / 2.5
+        else:
+            risk_tolerance = 0.0
+
+        # 4. Expansion rate: territori netti conquistati per turno
+        terr_conquistati = sum(m.get('territori_conquistati', 0) for m in mosse_recenti)
+        # Normalizza: clip [0, 5] → [0, 1]
+        expansion_rate = min(5.0, max(0.0, terr_conquistati / n_turni)) / 5.0
+
+        parti.append(np.array(
+            [aggressivita, focus_su_di_me, risk_tolerance, expansion_rate],
+            dtype=np.float32,
+        ))
+
+    return np.concatenate(parti)

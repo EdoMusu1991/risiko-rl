@@ -43,17 +43,17 @@ import random
 # ─────────────────────────────────────────────────────────────────────────
 
 def test_distribuzione_quantita_corrette():
-    """Distribuzione: Blu=11, Rosso=11, Verde=10, Giallo=10."""
+    """Distribuzione: Blu=10, Rosso=10, Verde=11, Giallo=11."""
     stato = StatoPartita()
     distribuisci_territori(stato, random.Random(42))
 
     conteggi = {col: stato.num_territori_di(col) for col in COLORI_GIOCATORI}
-    assert conteggi["BLU"] == 11, f"BLU ha {conteggi['BLU']}"
-    assert conteggi["ROSSO"] == 11, f"ROSSO ha {conteggi['ROSSO']}"
-    assert conteggi["VERDE"] == 10, f"VERDE ha {conteggi['VERDE']}"
-    assert conteggi["GIALLO"] == 10, f"GIALLO ha {conteggi['GIALLO']}"
+    assert conteggi["BLU"] == 10, f"BLU ha {conteggi['BLU']}"
+    assert conteggi["ROSSO"] == 10, f"ROSSO ha {conteggi['ROSSO']}"
+    assert conteggi["VERDE"] == 11, f"VERDE ha {conteggi['VERDE']}"
+    assert conteggi["GIALLO"] == 11, f"GIALLO ha {conteggi['GIALLO']}"
     assert sum(conteggi.values()) == 42
-    print("✓ Distribuzione 11/11/10/10 (totale 42)")
+    print("✓ Distribuzione 10/10/11/11 (totale 42)")
 
 
 def test_distribuzione_tutti_assegnati():
@@ -163,21 +163,22 @@ def test_obiettivi_distribuzione_uniforme():
 def test_piazzamento_armate_totali():
     """
     Dopo piazzamento iniziale + 1 carro automatico per territorio:
-    - Blu: 20 piazzati + 11 territori = 31 armate totali
-    - Rosso: 20 + 11 = 31
-    - Verde: 19 + 10 = 29
-    - Giallo: 19 + 10 = 29
+    - Blu: 20 piazzati + 10 territori = 30 armate totali
+    - Rosso: 20 + 10 = 30
+    - Verde: 19 + 11 = 30
+    - Giallo: 19 + 11 = 30
+    Tutti partono con 30 armate (specifica).
     """
     stato = StatoPartita()
     rng = random.Random(42)
     distribuisci_territori(stato, rng)
     piazzamento_iniziale_random(stato, rng)
 
-    attesi = {"BLU": 31, "ROSSO": 31, "VERDE": 29, "GIALLO": 29}
+    attesi = {"BLU": 30, "ROSSO": 30, "VERDE": 30, "GIALLO": 30}
     for colore, atteso in attesi.items():
         actual = stato.num_armate_di(colore)
         assert actual == atteso, f"{colore}: {actual} armate (atteso {atteso})"
-    print("✓ Piazzamento iniziale: Blu/Rosso=31, Verde/Giallo=29 armate totali")
+    print("✓ Piazzamento iniziale: tutti i giocatori 30 armate totali")
 
 
 def test_piazzamento_almeno_1_per_territorio():
@@ -278,12 +279,12 @@ def test_partita_iniziale_completa():
         assert s.proprietario in COLORI_GIOCATORI
         assert s.armate >= 1
 
-    # Totali armate per giocatore corretti
+    # Totali armate per giocatore corretti (tutti 30 da specifica)
     armate_totali = {col: stato.num_armate_di(col) for col in COLORI_GIOCATORI}
-    assert armate_totali["BLU"] == 31
-    assert armate_totali["ROSSO"] == 31
-    assert armate_totali["VERDE"] == 29
-    assert armate_totali["GIALLO"] == 29
+    assert armate_totali["BLU"] == 30
+    assert armate_totali["ROSSO"] == 30
+    assert armate_totali["VERDE"] == 30
+    assert armate_totali["GIALLO"] == 30
 
     # Mazzo pronto, scarti vuoti
     assert len(stato.mazzo_attivo) == 44
