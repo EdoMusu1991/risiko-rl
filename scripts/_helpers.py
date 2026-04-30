@@ -8,6 +8,29 @@ e configura l'env di conseguenza.
 
 import sys
 import os
+import io
+
+
+def force_utf8_output():
+    """
+    Forza UTF-8 sullo stdout/stderr su Windows. Necessario per stampare
+    emoji e barre Unicode (█, ░, ▶, ⚔️ ...) senza errori.
+
+    Da chiamare all'inizio di ogni script che stampa caratteri non-ASCII.
+    """
+    if sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf8'):
+        try:
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8',
+                                          errors='replace', line_buffering=True)
+            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8',
+                                          errors='replace', line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
+
+
+# Auto-applica il fix all'import
+force_utf8_output()
+
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -36,15 +59,15 @@ def carica_modello_con_autodetect(path: str, verbose: bool = True):
     if dim_modello == 318:
         _encoding.STAGE_A_ATTIVO = False
         if verbose:
-            print(f"⚠ Modello con observation a 318 feature (PRE-Stage A). "
-                  f"Stage A disabilitato per compatibilità.")
+            print(f"[!] Modello con observation a 318 feature (PRE-Stage A). "
+                  f"Stage A disabilitato per compatibilita.")
     elif dim_modello == 330:
         _encoding.STAGE_A_ATTIVO = True
         if verbose:
-            print(f"✓ Modello con observation a 330 feature (Stage A attivo).")
+            print(f"[OK] Modello con observation a 330 feature (Stage A attivo).")
     else:
         if verbose:
-            print(f"⚠ Modello con dimensione observation inattesa: {dim_modello}")
-            print(f"  L'env userà la sua dimensione di default.")
+            print(f"[!] Modello con dimensione observation inattesa: {dim_modello}")
+            print(f"    L'env usera la sua dimensione di default.")
 
     return model

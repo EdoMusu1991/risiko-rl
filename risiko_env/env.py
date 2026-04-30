@@ -457,7 +457,7 @@ class RisikoEnv(gym.Env):
             if armate_redistribuite or self.stato.terminata:
                 self._log(
                     "sdadata_o_cap",
-                    round=round_pre,
+                    round_sdadata=round_pre,
                     terminata=self.stato.terminata,
                     motivo_fine=self.stato.motivo_fine,
                 )

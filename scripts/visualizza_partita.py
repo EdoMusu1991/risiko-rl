@@ -18,7 +18,18 @@ Senza modello (giocatore RANDOM puro, per testare il visualizzatore):
 import argparse
 import sys
 import os
+import io
 from collections import Counter, defaultdict
+
+# Forza UTF-8 in stdout su Windows (per emoji e simboli)
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf8'):
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8',
+                                      errors='replace', line_buffering=True)
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8',
+                                      errors='replace', line_buffering=True)
+    except (AttributeError, ValueError):
+        pass  # già wrapped o stdout sostituito
 
 import numpy as np
 

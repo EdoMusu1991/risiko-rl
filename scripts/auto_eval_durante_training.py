@@ -30,6 +30,8 @@ from datetime import datetime
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _helpers  # noqa: F401 (auto-applica fix UTF-8)
 
 from risiko_env import RisikoEnv
 from risiko_env.data import COLORI_GIOCATORI
