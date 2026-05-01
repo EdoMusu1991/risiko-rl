@@ -286,10 +286,13 @@ def gioca_e_visualizza(
                 for e in turni:
                     stampa_turno_avversario(e, bot_color)
 
-        # Riassunto periodico
-        if r % intervallo_riassunto == 0 and r != last_round_stampato:
-            stampa_riassunto_round(env.stato, r, bot_color)
-            last_round_stampato = r
+        # Riassunto periodico — DISABILITATO
+        # Il riassunto stato non è affidabile a metà partita perché env.stato
+        # contiene lo stato FINALE (gli eventi sono processati post-partita).
+        # Mostriamo lo stato solo alla fine, nel summary finale.
+        # Per analisi più dettagliate per round, servirebbe snapshot in-flight
+        # nel logger di eventi (TODO futuro).
+        pass
 
     # Risultato finale
     print(f"\n{C.BOLD}{'═' * 70}{C.RESET}")
