@@ -40,6 +40,9 @@ def carica_modello_con_autodetect(path: str, verbose: bool = True):
     Carica un modello MaskablePPO e auto-configura l'env per matchare
     la sua dimensione observation.
 
+    Se path è una directory, cerca prioritariamente best_model.zip dentro
+    (convenzione per i nuovi training con MaskableEvalCallback).
+
     Returns:
         modello caricato
 
@@ -50,6 +53,19 @@ def carica_modello_con_autodetect(path: str, verbose: bool = True):
         from sb3_contrib import MaskablePPO
     except ImportError:
         raise ImportError("Installa: pip install sb3-contrib torch")
+
+    # Se è una cartella, cerca best_model.zip dentro
+    if os.path.isdir(path):
+        candidates = [
+            os.path.join(path, "best_model.zip"),
+            os.path.join(path, "best", "best_model.zip"),
+        ]
+        for cand in candidates:
+            if os.path.exists(cand):
+                if verbose:
+                    print(f"[INFO] Trovato best_model in {cand}")
+                path = cand
+                break
 
     model = MaskablePPO.load(path)
     dim_modello = model.observation_space.shape[0]

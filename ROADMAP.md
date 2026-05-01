@@ -228,6 +228,29 @@ Aggiunti test di regressione (4 test) e 3 documenti:
 
 ---
 
+### LEZIONE APPRESA: il "best model" non è il "final model"
+
+Durante il training v4.1-test abbiamo scoperto una verità controintuitiva:
+
+```
+1M step → 30% win rate (bot vincente)
+3M step → 19% win rate (bot conservativo, sopravvive ma non vince)
+```
+
+Il bot a 3M ha imparato a **aggirare** la penalty -0.001 (armate >= 125) tenendosi a 122 armate. Ha smesso di rischiare per chiudere le partite. Reward hacking.
+
+**Regole che applichiamo da ora in avanti**:
+
+1. **`MaskableEvalCallback`** durante ogni training: salva automaticamente il best model basato su reward medio in 20 partite di valutazione (ogni 100k step).
+
+2. **Mai valutare solo il modello finale**. Sempre confronto fra `best_model.zip` (auto-salvato) e `risiko_bot_finale.zip` (ultimo step).
+
+3. **Penalty graduali**, non a soglia secca. Una penalty `-0.001 if armate >= 125` insegna "stai a 124". Una penalty `-0.0005 * (armate - 100) / 30` cresce continuamente.
+
+4. **Replay sano è criterio non negoziabile**. Win rate alto MA stallo cristallizzato = scartiamo.
+
+---
+
 ### Stage B — Doppia finestra temporale
 
 **Cosa fa**: Il bot ricorda cosa hanno fatto gli avversari NON solo nelle ultime 8 mosse (presente) ma anche nelle ultime 20 (memoria di lungo termine).
