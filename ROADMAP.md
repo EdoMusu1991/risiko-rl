@@ -214,7 +214,7 @@ Aggiunti test di regressione (4 test) e 3 documenti:
 
 5 stage incrementali. Ognuno aggiunge un livello di "intelligenza".
 
-### Stage A — Opponent embedding ✅ codificato
+### Stage A — Opponent embedding 🟡 in test (training v6-stage-a)
 
 **Cosa fa**: Il bot vede statistiche sugli avversari (aggressività, focus, risk, expansion) e impara a profilarli.
 
