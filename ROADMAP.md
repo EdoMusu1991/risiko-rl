@@ -214,7 +214,21 @@ Aggiunti test di regressione (4 test) e 3 documenti:
 
 5 stage incrementali. Ognuno aggiunge un livello di "intelligenza".
 
-### Stage A — Opponent embedding 🟡 in test (training v6-stage-a)
+### Stage A — Opponent embedding 🔴 v1 fallita / 🟡 v2 (Stage A2) in test
+
+**Stage A v1 (FALLITA)**: 4 feature × 3 avversari (aggressivita, focus_su_di_me, risk_tolerance, expansion_rate). Win rate 19% [CI 16-23] vs baseline 29%. CI non sovrapposti.
+
+Diagnosi (verificata con `scripts/debug_stage_a.py`):
+- `risk_tolerance` era un proxy fisso (0.4 quando l'avversario conquista, 0 altrimenti)
+- `aggressivita`, `focus_su_di_me`, `expansion_rate` dipendevano dal SUCCESSO degli attacchi, non dal tentativo. Avversario aggressivo che fallisce = avversario passivo (indistinguibile)
+- Tutte le feature nel range [0, 0.5], spazio sotto-utilizzato
+
+**Stage A2 (in test)**: 8 feature × 3 avversari (24 totali). Feature di stato + storia leggera:
+1-3. territori, armate, continenti (forza)
+4-6. confini con me, armate sui confini, miei territori minacciati (vicinanza/minaccia)
+7-8. conquiste recenti, perdite recenti (cambio dinamico)
+
+Observation 318 → 342. Verificato con debug script: feature usano l'intero range [0, 1] e discriminano bene fra avversari diversi.
 
 **Cosa fa**: Il bot vede statistiche sugli avversari (aggressività, focus, risk, expansion) e impara a profilarli.
 

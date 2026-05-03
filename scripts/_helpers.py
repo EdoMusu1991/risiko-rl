@@ -78,9 +78,17 @@ def carica_modello_con_autodetect(path: str, verbose: bool = True):
             print(f"[!] Modello con observation a 318 feature (PRE-Stage A). "
                   f"Stage A disabilitato per compatibilita.")
     elif dim_modello == 330:
+        # Stage A v1 (versione fallita, 4 feature × 3 avversari).
+        # NON SUPPORTATO da Stage A2: feature diverse, modello non utilizzabile.
+        if verbose:
+            print(f"[!] Modello con observation a 330 feature (Stage A v1 deprecato). "
+                  f"Compatibilita non garantita con codice Stage A2.")
+        _encoding.STAGE_A_ATTIVO = True
+    elif dim_modello == 342:
+        # Stage A2 (8 feature di stato × 3 avversari)
         _encoding.STAGE_A_ATTIVO = True
         if verbose:
-            print(f"[OK] Modello con observation a 330 feature (Stage A attivo).")
+            print(f"[OK] Modello con observation a 342 feature (Stage A2 attivo).")
     else:
         if verbose:
             print(f"[!] Modello con dimensione observation inattesa: {dim_modello}")

@@ -107,6 +107,7 @@ class OpponentTracker:
             "attacchi_contro_pov": attacchi_contro_pov,
             "ratio_medio": ratio_medio,
             "territori_conquistati": territori_conquistati,
+            "territori_persi": len(territori_persi),  # Stage A2: # netto territori persi nel turno
         }
         self.storia[colore].append(mossa)
 

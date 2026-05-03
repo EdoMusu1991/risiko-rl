@@ -2,7 +2,7 @@
 test_opponent_profile.py — Test del Modulo Stage A (opponent embedding).
 
 Verifica:
-- DIM_OBSERVATION aumentato a 330
+- DIM_OBSERVATION aumentato a 342 (Stage A2: 8 feature × 3 avversari = 24)
 - Storia mosse popolata correttamente
 - Feature opponent profile coerenti
 - Storia bounded (max 50 mosse)
@@ -31,31 +31,55 @@ from risiko_env.setup import crea_partita_iniziale
 
 
 def test_dim_observation_aggiornata():
-    """DIM_OBSERVATION deve essere 330 (era 318)."""
-    assert DIM_OBSERVATION == 330, f"DIM_OBSERVATION sbagliata: {DIM_OBSERVATION}"
-    assert DIM_OPPONENT_PROFILE == 12
+    """DIM_OBSERVATION deve essere 342 (Stage A2: 8 feature × 3 avversari = 24)."""
+    assert DIM_OBSERVATION == 342, f"DIM_OBSERVATION sbagliata: {DIM_OBSERVATION}"
+    assert DIM_OPPONENT_PROFILE == 24
     print(f"✓ DIM_OBSERVATION = {DIM_OBSERVATION}, opponent profile = {DIM_OPPONENT_PROFILE}")
 
 
-def test_codifica_senza_storia_da_zeri():
-    """Senza storia, le 12 feature opponent profile devono essere zeri."""
+def test_codifica_senza_storia_riflette_stato():
+    """
+    Senza storia, le 24 feature riflettono lo stato corrente:
+    - feature 1-6 (di stato) hanno valori sensati (territori, armate, ecc.)
+    - feature 7-8 (storia) sono zero senza storia.
+
+    Stage A2: anche senza storia, il profilo NON e' tutto zeri perche' include
+    feature di stato calcolate dallo stato corrente.
+    """
     stato = crea_partita_iniziale(seed=42)
     obs = codifica_osservazione(stato, "BLU", storia_mosse=None)
     assert obs.shape == (DIM_OBSERVATION,)
     profilo = obs[-DIM_OPPONENT_PROFILE:]
-    assert np.allclose(profilo, 0.0), f"Profilo dovrebbe essere zeri: {profilo}"
-    print("✓ Senza storia: 12 feature opponent profile = 0")
+
+    # Stato iniziale: ogni avversario ha 9-11 territori e 30 armate
+    # Quindi territori_norm > 0 e armate_norm > 0 per tutti
+    for i in range(3):
+        feat_avv = profilo[i*8:(i+1)*8]
+        terr_norm = feat_avv[0]
+        arm_norm = feat_avv[1]
+        assert 0.15 < terr_norm < 0.30, f"Avv {i}: territori_norm fuori range: {terr_norm}"
+        assert 0.20 < arm_norm < 0.30, f"Avv {i}: armate_norm fuori range: {arm_norm}"
+
+        # Feature 7-8 (storia) devono essere zero senza storia
+        cnq_recenti = feat_avv[6]
+        per_recenti = feat_avv[7]
+        assert cnq_recenti == 0.0, f"Avv {i}: conquiste_recenti dovrebbe essere 0 senza storia"
+        assert per_recenti == 0.0, f"Avv {i}: perdite_recenti dovrebbe essere 0 senza storia"
+
+    print("✓ Senza storia: feature di stato OK, feature di storia = 0")
 
 
 def test_codifica_con_storia_popolata():
-    """Con storia, le feature riflettono il comportamento dell'avversario."""
+    """
+    Con storia di conquiste, le feature 7-8 (recency) sono > 0.
+    """
     stato = crea_partita_iniziale(seed=42)
     storia = {
         "ROSSO": [
             {"attaccato": True, "num_attacchi": 2, "attacchi_contro_pov": 2,
-             "ratio_medio": 1.5, "territori_conquistati": 1},
+             "ratio_medio": 1.5, "territori_conquistati": 2, "territori_persi": 0},
             {"attaccato": True, "num_attacchi": 1, "attacchi_contro_pov": 1,
-             "ratio_medio": 1.5, "territori_conquistati": 1},
+             "ratio_medio": 1.5, "territori_conquistati": 1, "territori_persi": 0},
         ],
         "VERDE": [],
         "GIALLO": [],
@@ -63,15 +87,19 @@ def test_codifica_con_storia_popolata():
     obs = codifica_osservazione(stato, "BLU", storia_mosse=storia)
     profilo = obs[-DIM_OPPONENT_PROFILE:]
 
-    # ROSSO: aggressivita=1.0, focus=1.0 (3/3 attacchi contro pov), risk=0.4 ((1.5-0.5)/2.5)
-    # ROSSO è il primo avversario di BLU (indici 0-3)
-    assert profilo[0] == 1.0, f"Aggressività ROSSO sbagliata: {profilo[0]}"
-    assert profilo[1] == 1.0, f"Focus ROSSO sbagliato: {profilo[1]}"
-    assert abs(profilo[2] - 0.4) < 0.01, f"Risk tolerance ROSSO sbagliato: {profilo[2]}"
-    # VERDE e GIALLO devono essere zero
-    assert np.allclose(profilo[4:8], 0.0), "VERDE dovrebbe essere zero"
-    assert np.allclose(profilo[8:12], 0.0), "GIALLO dovrebbe essere zero"
-    print(f"✓ Storia popolata: ROSSO ha aggressività=1.0, focus=1.0, risk=0.4")
+    # ROSSO ha conquistato 3 territori in totale negli ultimi 2 turni
+    # conquiste_recenti = min(1.0, 3/5) = 0.6
+    feat_rosso = profilo[0:8]
+    cnq_rosso = feat_rosso[6]
+    assert abs(cnq_rosso - 0.6) < 0.01, f"Conquiste recenti ROSSO sbagliate: {cnq_rosso}"
+
+    # VERDE e GIALLO: feature di storia (7,8) devono essere zero
+    feat_verde = profilo[8:16]
+    feat_giallo = profilo[16:24]
+    assert feat_verde[6] == 0.0 and feat_verde[7] == 0.0, "VERDE storia dovrebbe essere zero"
+    assert feat_giallo[6] == 0.0 and feat_giallo[7] == 0.0, "GIALLO storia dovrebbe essere zero"
+
+    print(f"✓ Storia popolata: ROSSO conquiste_recenti={cnq_rosso:.2f}")
 
 
 def test_storia_iniziale_vuota_in_env():
@@ -154,13 +182,20 @@ def test_reset_pulisce_storia():
 
 
 def test_observation_inserisce_profile_correttamente():
-    """L'observation prodotta da env contiene le 12 feature finali correttamente."""
+    """L'observation prodotta da env contiene le 24 feature Stage A2."""
     env = RisikoEnv(seed=42)
     obs, info = env.reset()
     assert obs.shape == (DIM_OBSERVATION,)
     profilo = obs[-DIM_OPPONENT_PROFILE:]
-    # All'inizio storia vuota → profilo zero
-    assert np.allclose(profilo, 0.0), f"Profilo iniziale non zero: {profilo}"
+    # Stage A2: anche all'inizio il profilo non e' zero (feature di stato attive)
+    # Le feature 1-6 (stato) hanno gia' valori. Le feature 7-8 (storia) sono zero.
+    # Verifica: per ogni avversario, almeno una feature di stato e' non-zero.
+    for i in range(3):
+        feat = profilo[i*8:(i+1)*8]
+        feat_stato = feat[:6]  # solo le 6 feature di stato
+        assert np.any(feat_stato > 0), f"Avv {i}: feature di stato tutte zero all'inizio"
+        # Feature 7-8 (storia) sono zero senza storia
+        assert feat[6] == 0.0 and feat[7] == 0.0, f"Avv {i}: feature di storia non zero"
 
     # Esegui un po'
     for _ in range(80):
@@ -172,7 +207,7 @@ def test_observation_inserisce_profile_correttamente():
             break
 
     profilo = obs[-DIM_OPPONENT_PROFILE:]
-    # Ora il profilo dovrebbe essere non-zero (almeno qualche feature)
+    # Ora il profilo dovrebbe essere non-zero
     assert np.any(profilo > 0), "Profilo ancora zero dopo step"
     # Tutte le feature in [0, 1]
     assert np.all(profilo >= 0) and np.all(profilo <= 1), \
@@ -183,7 +218,7 @@ def test_observation_inserisce_profile_correttamente():
 def main():
     tests = [
         test_dim_observation_aggiornata,
-        test_codifica_senza_storia_da_zeri,
+        test_codifica_senza_storia_riflette_stato,
         test_codifica_con_storia_popolata,
         test_storia_iniziale_vuota_in_env,
         test_storia_popolata_dopo_step,

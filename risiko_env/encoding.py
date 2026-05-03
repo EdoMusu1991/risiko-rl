@@ -47,18 +47,39 @@ DIM_CONTROLLO_CONTINENTI = NUM_CONTINENTI * NUM_GIOCATORI  # chi controlla ogni 
 DIM_FASE_E_TURNO = 6  # [round_norm, fase_one_hot(4), conquiste_turno_norm]
 DIM_TRIS_GIOCATI = 3  # numero di tris giocati nella partita per ogni simbolo (info pubblica)
 
-# Stage A: opponent profile (4 feature × 3 avversari)
-# Per ogni avversario, calcolate sulle ultime FINESTRA_OPPONENT_PROFILE mosse:
-#   - aggressivita: % turni con almeno un attacco (0-1)
-#   - focus_su_di_me: % attacchi diretti contro POV (0-1)
-#   - risk_tolerance: ratio medio armate attaccante/difensore (normalizzato 0-1)
-#   - expansion_rate: territori conquistati per turno giocato (normalizzato 0-1)
-DIM_OPPONENT_PROFILE = (NUM_GIOCATORI - 1) * 4  # 12
+# === STAGE A2: opponent profile RIPROGETTATO ===
+# Lezione da Stage A v1 (fallito, 19% WR vs baseline 29%):
+# Le feature precedenti (aggressivita, focus, risk_tolerance, expansion_rate)
+# erano semanticamente povere:
+#   - dipendevano dal SUCCESSO degli attacchi (avversario aggressivo che fallisce
+#     era indistinguibile da avversario passivo)
+#   - risk_tolerance era una proxy fissa (0.4 sempre)
+#   - 3 feature su 4 misuravano la stessa cosa (avversario ha conquistato qualcosa)
+#
+# Stage A2 usa FEATURE DI STATO (calcolate dallo stato corrente, non da storia):
+# Per ogni avversario:
+#   1. territori_norm     — # territori / 42 (forza territoriale)
+#   2. armate_norm        — # armate / 130 (forza militare)
+#   3. continenti_norm    — # continenti controllati / 6 (forza strategica)
+#   4. confini_pov_norm   — # mie border-cells adiacenti a suoi territori / 42
+#                            (vicinanza/minaccia geografica)
+#   5. armate_confini_norm— armate sui suoi territori adiacenti ai miei /
+#                            armate totali sue (concentrazione minaccia)
+#   6. miei_minacciati_norm— # miei territori con un suo vicino piu' forte / # miei terr
+#                            (minaccia immediata)
+#   7. conquiste_recenti  — # territori netti guadagnati negli ultimi N turni / 5
+#                            (espansione recente, FATTI non interpretazioni)
+#   8. perdite_recenti    — # territori netti persi negli ultimi N turni / 5
+#                            (vulnerabilita' recente)
+#
+# Feature 1-6: PURAMENTE DI STATO (deterministiche, calcolabili istantaneamente)
+# Feature 7-8: STORICHE LEGGERE (ultimi N turni, contano fatti non eventi)
+DIM_OPPONENT_PROFILE = (NUM_GIOCATORI - 1) * 8  # 24
 
-# Finestra temporale per il profilo (ultimi N turni di ogni avversario)
-FINESTRA_OPPONENT_PROFILE = 8
+# Finestra per feature 7-8 (conquiste/perdite recenti)
+FINESTRA_OPPONENT_PROFILE = 5
 
-# Stage A può essere disabilitato per retrocompatibilità con modelli vecchi (318 feature)
+# Stage A puo' essere disabilitato per retrocompatibilita' con modelli vecchi (318 feature)
 # Variabile globale modificabile a runtime
 STAGE_A_ATTIVO = True
 
@@ -316,7 +337,7 @@ def _codifica_tris_giocati(stato: StatoPartita) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#  STAGE A: OPPONENT PROFILE
+#  STAGE A2: OPPONENT PROFILE (feature di stato)
 # ─────────────────────────────────────────────────────────────────────────
 
 def _codifica_opponent_profile(
@@ -325,65 +346,111 @@ def _codifica_opponent_profile(
     storia_mosse: dict | None,
 ) -> np.ndarray:
     """
-    Per ogni avversario, calcola 4 feature sulle ultime FINESTRA_OPPONENT_PROFILE mosse:
+    Per ogni avversario, calcola 8 feature di profilo (Stage A2).
 
-    1. aggressivita    — % turni in cui ha attaccato almeno una volta (0-1)
-    2. focus_su_di_me  — % attacchi diretti contro POV (0-1)
-    3. risk_tolerance  — ratio medio armate attaccante/difensore (clip a [0.5, 3.0], norm)
-    4. expansion_rate  — territori netti conquistati per turno giocato (clip [0, 5], norm)
+    Le prime 6 sono PURAMENTE DI STATO (dallo stato corrente, no storia).
+    Le ultime 2 usano la storia recente per "conquiste/perdite ultimi N turni".
 
-    Se storia_mosse è None o avversario senza storia, restituisce zeri.
+    1. territori_norm        — # territori / 42
+    2. armate_norm           — # armate / 130
+    3. continenti_norm       — # continenti controllati / 6
+    4. confini_pov_norm      — # miei territori adiacenti a suoi / 42
+    5. armate_confini_norm   — armate sue sui confini con me / armate sue totali
+    6. miei_minacciati_norm  — # miei territori con un suo vicino piu' forte / # miei terr
+    7. conquiste_recenti     — # territori netti guadagnati ultimi N turni / 5
+    8. perdite_recenti       — # territori netti persi ultimi N turni / 5
 
-    Ordine: avversari ordinati per indice colore (escluso POV).
-    Output: np.ndarray shape (12,) = 4 feature × 3 avversari.
+    Output: np.ndarray shape (24,) = 8 feature × 3 avversari.
     """
+    from .data import ADIACENZE, CONTINENTI as _CONT
+
     parti = []
-    pov_idx = COLORE_INDEX[colore_pov]
     avversari = [c for c in COLORI_GIOCATORI if c != colore_pov]
 
+    # Pre-calcola: insieme territori del POV e armate per territorio
+    miei_territori = set()
+    for t, st in stato.mappa.items():
+        if st.proprietario == colore_pov:
+            miei_territori.add(t)
+
+    n_miei = max(1, len(miei_territori))  # evita div/0
+
     for avv in avversari:
-        if storia_mosse is None or avv not in storia_mosse or not storia_mosse[avv]:
-            # Nessuna storia: profile a zero
-            parti.append(np.zeros(4, dtype=np.float32))
-            continue
+        # === FEATURE DI STATO (1-6) ===
 
-        # Prendi le ultime FINESTRA mosse
-        mosse_recenti = list(storia_mosse[avv])[-FINESTRA_OPPONENT_PROFILE:]
-        n_turni = len(mosse_recenti)
+        # 1. Territori dell'avversario (norm su 42)
+        suoi_territori = [t for t, s in stato.mappa.items() if s.proprietario == avv]
+        territori_norm = len(suoi_territori) / float(NUM_TERRITORI)
 
-        if n_turni == 0:
-            parti.append(np.zeros(4, dtype=np.float32))
-            continue
+        # 2. Armate dell'avversario (norm su 130 = cap)
+        sue_armate_tot = sum(stato.mappa[t].armate for t in suoi_territori)
+        armate_norm = min(1.0, sue_armate_tot / 130.0)
 
-        # 1. Aggressività: % turni con almeno un attacco
-        n_turni_aggressivi = sum(1 for m in mosse_recenti if m.get('attaccato', False))
-        aggressivita = n_turni_aggressivi / n_turni
+        # 3. Continenti controllati (norm su 6)
+        n_continenti = 0
+        for cont_terr in _CONT.values():
+            if all(stato.mappa[t].proprietario == avv for t in cont_terr):
+                n_continenti += 1
+        continenti_norm = n_continenti / 6.0
 
-        # 2. Focus su POV: rapporto attacchi-contro-pov / attacchi-totali
-        attacchi_totali = sum(m.get('num_attacchi', 0) for m in mosse_recenti)
-        attacchi_contro_pov = sum(m.get('attacchi_contro_pov', 0) for m in mosse_recenti)
-        if attacchi_totali > 0:
-            focus_su_di_me = attacchi_contro_pov / attacchi_totali
+        # 4. Confini con me: # MIEI territori adiacenti ad almeno un suo territorio
+        #    (norm su 42 — quanto e' "vicino" geograficamente al mio impero)
+        confini_count = 0
+        suoi_set = set(suoi_territori)
+        for mio_t in miei_territori:
+            if any(vic in suoi_set for vic in ADIACENZE[mio_t]):
+                confini_count += 1
+        confini_pov_norm = confini_count / float(NUM_TERRITORI)
+
+        # 5. Armate sue sui confini con me / armate sue totali
+        #    (concentrazione minaccia: alta = ha massato truppe contro di me)
+        armate_confini = 0
+        miei_set = miei_territori
+        for suo_t in suoi_territori:
+            if any(vic in miei_set for vic in ADIACENZE[suo_t]):
+                armate_confini += stato.mappa[suo_t].armate
+        if sue_armate_tot > 0:
+            armate_confini_norm = armate_confini / sue_armate_tot
         else:
-            focus_su_di_me = 0.0
+            armate_confini_norm = 0.0
 
-        # 3. Risk tolerance: ratio medio
-        ratios = [m.get('ratio_medio', 0.0) for m in mosse_recenti
-                  if m.get('ratio_medio', 0.0) > 0]
-        if ratios:
-            ratio_medio = sum(ratios) / len(ratios)
-            # Normalizza: clip [0.5, 3.0] → [0, 1]
-            risk_tolerance = (min(3.0, max(0.5, ratio_medio)) - 0.5) / 2.5
-        else:
-            risk_tolerance = 0.0
+        # 6. Miei territori minacciati: # miei territori che hanno un vicino dell'avv
+        #    con armate >= armate del mio territorio (norm su # miei terr)
+        miei_minacciati = 0
+        for mio_t in miei_territori:
+            mie_armate_t = stato.mappa[mio_t].armate
+            for vic in ADIACENZE[mio_t]:
+                if vic in suoi_set and stato.mappa[vic].armate >= mie_armate_t:
+                    miei_minacciati += 1
+                    break  # 1 minaccia basta
+        miei_minacciati_norm = miei_minacciati / float(n_miei)
 
-        # 4. Expansion rate: territori netti conquistati per turno
-        terr_conquistati = sum(m.get('territori_conquistati', 0) for m in mosse_recenti)
-        # Normalizza: clip [0, 5] → [0, 1]
-        expansion_rate = min(5.0, max(0.0, terr_conquistati / n_turni)) / 5.0
+        # === FEATURE DI STORIA RECENTE (7-8) ===
+        # Usa la storia mosse per contare territori conquistati/persi ultimi N turni
+        # NB: queste feature sono robuste perche' contano territori netti
+        # (fatti, non interpretazioni di "attacchi").
+
+        conquiste_recenti = 0.0
+        perdite_recenti = 0.0
+        if storia_mosse is not None and avv in storia_mosse and storia_mosse[avv]:
+            mosse_recenti = list(storia_mosse[avv])[-FINESTRA_OPPONENT_PROFILE:]
+            tot_conq = sum(m.get('territori_conquistati', 0) for m in mosse_recenti)
+            tot_persi = sum(m.get('territori_persi', 0) for m in mosse_recenti)
+            # Norm su 5 (territori in N turni)
+            conquiste_recenti = min(1.0, tot_conq / 5.0)
+            perdite_recenti = min(1.0, tot_persi / 5.0)
 
         parti.append(np.array(
-            [aggressivita, focus_su_di_me, risk_tolerance, expansion_rate],
+            [
+                territori_norm,
+                armate_norm,
+                continenti_norm,
+                confini_pov_norm,
+                armate_confini_norm,
+                miei_minacciati_norm,
+                conquiste_recenti,
+                perdite_recenti,
+            ],
             dtype=np.float32,
         ))
 
