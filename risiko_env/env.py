@@ -146,6 +146,9 @@ class RisikoEnv(gym.Env):
         max_steps: int = 5000,
         seed: Optional[int] = None,
         log_eventi: bool = False,
+        avversari: Optional[dict] = None,
+        mode_1v1: bool = False,
+        reward_mode: str = "binary",  # "binary" o "margin"
     ):
         """
         Args:
@@ -154,13 +157,52 @@ class RisikoEnv(gym.Env):
             seed: per riproducibilità
             log_eventi: se True, registra eventi della partita in self._eventi
                 (per visualizzazione/replay). Spegne in training (overhead).
+            avversari: dict opzionale {colore: bot} per controllare gli altri 3
+                giocatori. Ogni `bot` puo' essere:
+                - None: bot random (default)
+                - Un modello sb3-contrib MaskablePPO caricato (per self-play)
+                Esempio: {"ROSSO": modello_gen0, "VERDE": None, "GIALLO": modello_gen1}
+                Default: tutti random (compatibilita' all'indietro).
+            mode_1v1: se True, partita 2 giocatori (BLU vs ROSSO).
+                VERDE e GIALLO sono dichiarati morti dal setup, i loro
+                territori vengono ridistribuiti fra BLU e ROSSO (~21 ciascuno).
+                Sdadata cap aumentato a 60 round.
+                Usato per AlphaZero MCTS prototipo (Mese 1).
+            reward_mode: "binary" (default, +1/-1/0.3/-0.3) o "margin"
+                (margine punti relativi a fine partita, in [-1, +1]).
         """
         super().__init__()
         assert bot_color in COLORI_GIOCATORI, f"Colore invalido: {bot_color}"
+        if mode_1v1:
+            assert bot_color in ("BLU", "ROSSO"), (
+                f"In mode_1v1, bot_color deve essere BLU o ROSSO, non {bot_color}"
+            )
+        assert reward_mode in ("binary", "margin"), f"reward_mode invalido: {reward_mode}"
         self.bot_color = bot_color
         self.max_steps = max_steps
         self._initial_seed = seed
         self.log_eventi = log_eventi
+        self.mode_1v1 = mode_1v1
+        self.reward_mode = reward_mode
+
+        # Self-play: bot custom per i 3 avversari (None = random)
+        # Validazione: solo colori avversari, no overlap con bot_color
+        self._avversari_custom: dict = {}
+        if avversari is not None:
+            for col, bot in avversari.items():
+                assert col in COLORI_GIOCATORI, f"Colore invalido in avversari: {col}"
+                assert col != bot_color, f"Non puoi mettere bot_color={bot_color} fra gli avversari"
+                self._avversari_custom[col] = bot
+
+        # Self-play: flag che disabilita il loop _avanza_fino_a_turno_bot dentro
+        # step(). Usato dal mini-env in bot_rl_opponent.gioca_turno_rl per
+        # evitare loop infiniti (il mini-env deve fermarsi a fine turno bot,
+        # non continuare al giro successivo). NORMAL USAGE: lascia False.
+        self._skip_giro_avversari = False
+        # Self-play: flag che disabilita _fine_turno_bot (pesca + sdadata).
+        # Usato dal mini-env: il padre eseguira' pesca+sdadata dopo il return
+        # della funzione gioca_turno_rl, esattamente come fa con gioca_turno_random.
+        self._skip_fine_turno_bot = False
 
         # Componenti modulari (estratti durante refactoring)
         self._tracker = OpponentTracker(bot_color=self.bot_color)
@@ -208,6 +250,113 @@ class RisikoEnv(gym.Env):
         self._logger.eventi = value
 
     # ─────────────────────────────────────────────────────────────
+    #  SNAPSHOT / RESTORE (per MCTS)
+    # ─────────────────────────────────────────────────────────────
+    #
+    # API per simulare azioni in modo reversibile.
+    # MCTS chiama snapshot() per salvare lo stato, esplora con step(),
+    # poi restore(snap) per tornare allo stato originale.
+    #
+    # 4 garanzie obbligatorie (test in tests/test_snapshot_restore.py):
+    #   1. Idempotenza: snapshot -> restore -> snapshot identico
+    #   2. Determinismo: stesso stato + stessa azione = stesso risultato
+    #   3. Replay: stessa sequenza azioni da snapshot = stesso esito finale
+    #   4. No side effects: simulazioni non alterano env reale
+    #
+    # Cosa cloniamo (stato dinamico):
+    #   - stato (StatoPartita: mappa, giocatori, carte, mazzo, round, turno)
+    #   - rng (random.Random: dadi, mescolamento; getstate/setstate)
+    #   - sotto_fase, step_count
+    #   - flag transitori: _combinazioni_tris, _rinforzi_rimasti,
+    #     _attacco_corrente, _esito_attacco_corrente, _spostamento_corrente,
+    #     _tris_giocato_questo_turno, _rinforzi_correnti
+    #   - _tracker (OpponentTracker.storia + _ultimo_terr_set)
+    #   - _logger (EventLogger.eventi)
+    #
+    # Cosa NON cloniamo (statico/read-only o esterni):
+    #   - bot_color, max_steps, _initial_seed, log_eventi
+    #   - _avversari_custom (modelli RL, sono read-only durante simulazione)
+    #   - observation_space, action_space (Gymnasium spaces)
+    #   - flag config: _skip_giro_avversari, _skip_fine_turno_bot
+
+    def snapshot(self) -> dict:
+        """
+        Cattura lo stato dinamico completo dell'env.
+        Ritorna un dict che puo' essere passato a restore() per ripristinare.
+
+        Performance target: < 1ms (chiamato migliaia di volte da MCTS).
+        """
+        import copy
+
+        snap = {
+            # Stato di gioco (deep copy)
+            "stato": copy.deepcopy(self.stato),
+            # RNG: usa getstate() per serializzazione
+            "rng_state": self.rng.getstate() if self.rng is not None else None,
+            # Scalari/None (no copy needed, immutabili)
+            "sotto_fase": self.sotto_fase,
+            "step_count": self.step_count,
+            # Flag transitori
+            "_combinazioni_tris": copy.deepcopy(self._combinazioni_tris),
+            "_rinforzi_rimasti": self._rinforzi_rimasti,
+            "_attacco_corrente": self._attacco_corrente,  # tuple[str,str], immutable
+            "_esito_attacco_corrente": copy.deepcopy(self._esito_attacco_corrente),
+            "_spostamento_corrente": self._spostamento_corrente,
+            # Lazy attrs (potrebbero non esistere, gestiamo con getattr)
+            "_tris_giocato_questo_turno": getattr(self, "_tris_giocato_questo_turno", False),
+            "_rinforzi_correnti": copy.deepcopy(getattr(self, "_rinforzi_correnti", {})),
+            # Componenti modulari
+            "_tracker_storia": copy.deepcopy(self._tracker.storia),
+            "_tracker_ultimo_terr_set": copy.deepcopy(self._tracker._ultimo_terr_set),
+            "_logger_eventi": copy.deepcopy(self._logger.eventi),
+        }
+        return snap
+
+    def restore(self, snap: dict) -> None:
+        """
+        Ripristina lo stato dell'env da uno snapshot creato con snapshot().
+
+        L'env torna esattamente al punto in cui snapshot() era stato chiamato.
+        Tutte le modifiche fatte dopo lo snapshot vengono annullate.
+        """
+        import copy
+        import random
+
+        # Stato di gioco
+        self.stato = copy.deepcopy(snap["stato"])
+
+        # RNG: ricrea Random vuoto e setstate
+        if snap["rng_state"] is not None:
+            self.rng = random.Random()
+            self.rng.setstate(snap["rng_state"])
+        else:
+            self.rng = None
+
+        # Scalari/None
+        self.sotto_fase = snap["sotto_fase"]
+        self.step_count = snap["step_count"]
+
+        # Flag transitori (deep copy per liste/dict mutabili)
+        self._combinazioni_tris = copy.deepcopy(snap["_combinazioni_tris"])
+        self._rinforzi_rimasti = snap["_rinforzi_rimasti"]
+        self._attacco_corrente = snap["_attacco_corrente"]
+        self._esito_attacco_corrente = copy.deepcopy(snap["_esito_attacco_corrente"])
+        self._spostamento_corrente = snap["_spostamento_corrente"]
+
+        # Lazy attrs
+        self._tris_giocato_questo_turno = snap["_tris_giocato_questo_turno"]
+        self._rinforzi_correnti = copy.deepcopy(snap["_rinforzi_correnti"])
+
+        # Componenti modulari
+        self._tracker.storia = copy.deepcopy(snap["_tracker_storia"])
+        self._tracker._ultimo_terr_set = copy.deepcopy(snap["_tracker_ultimo_terr_set"])
+        self._logger.eventi = copy.deepcopy(snap["_logger_eventi"])
+
+    def clone(self) -> dict:
+        """Alias di snapshot() (compatibilita' API ChatGPT)."""
+        return self.snapshot()
+
+    # ─────────────────────────────────────────────────────────────
     #  RESET
     # ─────────────────────────────────────────────────────────────
 
@@ -221,6 +370,12 @@ class RisikoEnv(gym.Env):
 
         # Seed per setup partita
         self.stato = crea_partita_iniziale(seed=seed)
+
+        # Modalità 1v1: dichiaro morti VERDE e GIALLO, ridistribuisco i loro
+        # territori e armate fra BLU e ROSSO (mantengono la mappa intera).
+        if self.mode_1v1:
+            self._converti_a_1v1()
+
         # Seed diverso per il rng di gioco (evita correlazioni con setup)
         rng_seed = (seed * 7 + 13) if seed is not None else None
         self.rng = random.Random(rng_seed)
@@ -294,10 +449,15 @@ class RisikoEnv(gym.Env):
         if not self.stato.terminata:
             if self.sotto_fase is None:
                 turno_appena_finito = True
-                # Il bot ha finito il turno → vai al prossimo turno (altri o bot)
-                self._fine_turno_bot()
-                if not self.stato.terminata:
-                    self._avanza_fino_a_turno_bot()
+                # Self-play: il mini-env esce qui, il padre fa pesca + sdadata + avanza
+                if self._skip_fine_turno_bot:
+                    pass  # esci subito, non chiamare _fine_turno_bot
+                else:
+                    # Il bot ha finito il turno → vai al prossimo turno (altri o bot)
+                    self._fine_turno_bot()
+                    # Self-play: se il flag e' attivo, NON eseguire i turni avversari
+                    if not self.stato.terminata and not self._skip_giro_avversari:
+                        self._avanza_fino_a_turno_bot()
 
         # Calcola reward
         reward = 0.0
@@ -350,6 +510,19 @@ class RisikoEnv(gym.Env):
                     and delta_terr <= 0):
                 reward -= 0.001
 
+            # === SELF-PLAY: bonus carta-friendly ===
+            # Incentivi leggeri per scoprire prima la strategia "cartina"
+            # (cooperazione tacita per pescare carte → tris → vantaggio).
+            # NOTA: bonus piccoli, non sostituiscono la statistica vera.
+
+            # Bonus per pescare carta (= aver conquistato almeno 1 territorio nel turno)
+            if turno_appena_finito and delta_terr > 0:
+                reward += 0.005  # piccolo: incentiva ma non drogo le decisioni
+
+            # Bonus per giocare tris (sfrutta le carte accumulate)
+            if turno_appena_finito and getattr(self, "_tris_giocato_questo_turno", False):
+                reward += 0.02  # tris vale ~10 carri: il bonus reward riflette il valore
+
         obs = self._costruisci_observation()
         info = self._costruisci_info()
 
@@ -368,6 +541,89 @@ class RisikoEnv(gym.Env):
         from .obiettivi import calcola_punti_in_obiettivo
         # Usa la funzione esistente: punti = territori in obiettivo
         return calcola_punti_in_obiettivo(self.stato, colore)
+
+    # ─────────────────────────────────────────────────────────────
+    #  MODALITA' 1V1 (per AlphaZero MCTS prototipo)
+    # ─────────────────────────────────────────────────────────────
+
+    def _converti_a_1v1(self) -> None:
+        """
+        Converte la partita appena creata da 4 giocatori a 2 (BLU vs ROSSO).
+        VERDE e GIALLO sono dichiarati morti, i loro territori e armate
+        ridistribuiti fra BLU e ROSSO mantenendo la mappa intera.
+
+        Strategia di ridistribuzione: deterministica basata su seed.
+        Per ogni territorio dei morti, alterna tra BLU e ROSSO.
+        Le armate restano sul territorio (nessuna penalita').
+        """
+        import random as _random
+
+        # rng locale deterministico per la ridistribuzione
+        # (nota: usa _initial_seed, non self.rng che non e' ancora creato)
+        seed_local = (self._initial_seed or 0) * 31 + 17
+        rng_local = _random.Random(seed_local)
+
+        # 1. Raccolgo territori dei "morti"
+        territori_morti = []
+        for t, terr_stato in self.stato.mappa.items():
+            if terr_stato.proprietario in ("VERDE", "GIALLO"):
+                territori_morti.append(t)
+
+        # Mescola per distribuzione uniforme
+        rng_local.shuffle(territori_morti)
+
+        # 2. Ridistribuisco alternando BLU/ROSSO
+        # Per equilibrio ulteriore, comincio col giocatore con meno territori
+        n_blu = sum(1 for t in self.stato.mappa.values() if t.proprietario == "BLU")
+        n_rosso = sum(1 for t in self.stato.mappa.values() if t.proprietario == "ROSSO")
+        primo = "BLU" if n_blu <= n_rosso else "ROSSO"
+        secondo = "ROSSO" if primo == "BLU" else "BLU"
+
+        for i, t in enumerate(territori_morti):
+            nuovo_propr = primo if i % 2 == 0 else secondo
+            self.stato.mappa[t].proprietario = nuovo_propr
+
+        # 3. Dichiaro morti VERDE e GIALLO
+        for col in ("VERDE", "GIALLO"):
+            self.stato.giocatori[col].vivo = False
+            # Non hanno più carte (le carte vanno al mazzo scarti? No: tolte)
+            # Per coerenza, le svuotiamo. Le carte non vanno nel mazzo perche'
+            # complicherebbe il mazzo iniziale.
+            self.stato.giocatori[col].carte = []
+
+    def _calcola_punti_finali(self, colore: str) -> int:
+        """
+        Calcola i punti finali di un giocatore (regole standard Risiko):
+          - Punti in obiettivo (territori del proprio obiettivo posseduti)
+          - + Punti fuori obiettivo (territori posseduti non in obiettivo)
+        Vedi sezione 6 della specifica.
+        """
+        from .obiettivi import calcola_punti_in_obiettivo, calcola_punti_fuori_obiettivo
+        return (
+            calcola_punti_in_obiettivo(self.stato, colore)
+            + calcola_punti_fuori_obiettivo(self.stato, colore)
+        )
+
+    def _calcola_reward_margin(self) -> float:
+        """
+        Reward come margine di punti relativo a fine partita, in [-1, +1].
+        Formula: (punti_propri - punti_max_avversari_vivi) / 100, clipped.
+
+        Cattura "fare più punti degli altri" senza essere binario.
+        Esempio: vinco 60 vs 40 -> +0.20. Perdo 30 vs 70 -> -0.40.
+        """
+        miei_punti = self._calcola_punti_finali(self.bot_color)
+        avversari_punti = [
+            self._calcola_punti_finali(c)
+            for c in COLORI_GIOCATORI
+            if c != self.bot_color and self.stato.giocatori[c].vivo
+        ]
+        if not avversari_punti:
+            # Tutti gli avversari sono morti: vittoria piena
+            return 1.0
+        max_avversario = max(avversari_punti)
+        margine = (miei_punti - max_avversario) / 100.0
+        return float(np.clip(margine, -1.0, 1.0))
 
     # ─────────────────────────────────────────────────────────────
     #  FLUSSO TURNO BOT
@@ -393,11 +649,24 @@ class RisikoEnv(gym.Env):
                 self._inizia_fase_tris()
                 break
 
-            # Turno di un avversario: bot random
+            # Turno di un avversario: bot random, euristico, o RL custom
             # STAGE A: snapshot pre-turno per tracking opponent profile
             snapshot_pre = self._snapshot_per_storia(corrente)
 
-            gioca_turno_random(self.stato, corrente, self.rng)
+            # Self-play: se questo colore ha un bot custom, usalo
+            # bot_custom puo' essere:
+            #   - None -> bot random (default)
+            #   - "euristico" -> bot euristico (stringa magica per rollout MCTS)
+            #   - un modello sb3-contrib MaskablePPO -> bot RL
+            bot_custom = self._avversari_custom.get(corrente)
+            if bot_custom is None:
+                gioca_turno_random(self.stato, corrente, self.rng)
+            elif bot_custom == "euristico":
+                from .bot_euristico import gioca_turno_euristico
+                gioca_turno_euristico(self.stato, corrente, self.rng)
+            else:
+                from .bot_rl_opponent import gioca_turno_rl
+                gioca_turno_rl(self.stato, corrente, bot_custom, self.rng)
             if self.stato.terminata:
                 # Registra comunque la mossa (con dati parziali) e termina
                 self._registra_mossa(corrente, snapshot_pre)
@@ -485,6 +754,8 @@ class RisikoEnv(gym.Env):
         carte = self.stato.giocatori[self.bot_color].carte
         self._combinazioni_tris = enumera_combinazioni_tris(carte)
         self.sotto_fase = SottoFase.TRIS
+        # Self-play reward shaping: reset flag tris a inizio turno
+        self._tris_giocato_questo_turno = False
 
     def _step_tris(self, action: int) -> None:
         """Bot ha scelto quale combinazione di tris giocare (0=skip)."""
@@ -493,6 +764,8 @@ class RisikoEnv(gym.Env):
             action = 0  # fallback su skip
 
         scelta = self._combinazioni_tris[action]
+        # Self-play: traccia se ha giocato tris (per reward shaping carta-friendly)
+        self._tris_giocato_questo_turno = bool(scelta)
         if scelta:
             # Gioca i tris scelti
             gioca_tris(self.stato, self.bot_color, scelta)
@@ -871,12 +1144,18 @@ class RisikoEnv(gym.Env):
     def _calcola_reward_finale(self) -> float:
         """
         Reward sparso a fine partita basato sulla posizione del bot.
-        +1 se vince, -1 se eliminato, valori intermedi per posizioni intermedie.
 
-        IMPORTANTE: usa gli STESSI 3 criteri di determina_vincitore per
-        ordinare i giocatori (punti obiettivo > punti fuori > ordine inverso).
-        Altrimenti il reward sarebbe inconsistente con il vincitore reale.
+        Due modalita':
+        - "binary" (default): +1 se vince, -1 se eliminato, 0.3/-0.3 intermedi
+        - "margin": (punti_propri - punti_max_avversari) / 100, clipped [-1, +1]
+
+        IMPORTANTE: in modalita' binary usa i 3 criteri di determina_vincitore
+        (punti obiettivo > punti fuori > ordine inverso) per coerenza.
         """
+        if self.reward_mode == "margin":
+            return self._calcola_reward_margin()
+
+        # === MODALITA' BINARY (default, retrocompatibile) ===
         if self.stato.vincitore == self.bot_color:
             return REWARD_PER_POSIZIONE[1]
 

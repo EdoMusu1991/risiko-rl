@@ -41,10 +41,18 @@ class OpponentTracker:
         self.storia: dict = {
             c: [] for c in COLORI_GIOCATORI if c != bot_color
         }
+        # Stage A2 fix: tieni traccia dell'ultimo set di territori posseduti da
+        # ciascun avversario alla FINE del suo turno precedente. Questo permette
+        # di calcolare le PERDITE subite mentre era inattivo (i.e. attacchi
+        # contro di lui da parte di altri).
+        self._ultimo_terr_set: dict = {
+            c: None for c in COLORI_GIOCATORI if c != bot_color
+        }
 
     def reset(self) -> None:
         """Azzera tutta la storia (chiamato dal reset() dell'env)."""
         self.storia = {c: [] for c in COLORI_GIOCATORI if c != self.bot_color}
+        self._ultimo_terr_set = {c: None for c in COLORI_GIOCATORI if c != self.bot_color}
 
     def snapshot_pre_turno(self, stato: StatoPartita, colore: str) -> dict:
         """Snapshot dello stato pre-turno avversario, da passare a registra_mossa."""
@@ -82,16 +90,28 @@ class OpponentTracker:
         if colore == self.bot_color or colore not in self.storia:
             return
 
+        terr_pre = snapshot_pre["territori_propri_pre"]
         terr_post = set(stato.territori_di(colore))
 
-        # Territori che l'avversario aveva e ha perso
-        territori_persi = snapshot_pre["territori_propri_pre"] - terr_post
-        # Territori che l'avversario ha guadagnato (= conquistati)
-        territori_guadagnati = terr_post - snapshot_pre["territori_propri_pre"]
+        # === Conquiste durante il SUO turno ===
+        # Territori che ha guadagnato attivamente
+        territori_guadagnati = terr_post - terr_pre
         # Di questi guadagni, quanti erano del POV?
         territori_strappati_a_pov = (
             territori_guadagnati & snapshot_pre["territori_pov_pre"]
         )
+
+        # === Perdite cross-turn (subite mentre era inattivo) ===
+        # Confronto: territori_persi = (set fine turno scorso) - (set inizio turno corrente)
+        # Questo cattura i territori che gli sono stati strappati negli intermezzi.
+        ultimo = self._ultimo_terr_set.get(colore)
+        if ultimo is not None:
+            territori_persi_cross = ultimo - terr_pre
+        else:
+            territori_persi_cross = set()  # primo turno, nessun riferimento
+
+        # Aggiorna ultimo set per il prossimo giro
+        self._ultimo_terr_set[colore] = terr_post
 
         n_attacchi_stimati = len(territori_guadagnati)
         territori_conquistati = len(territori_guadagnati)
@@ -107,7 +127,9 @@ class OpponentTracker:
             "attacchi_contro_pov": attacchi_contro_pov,
             "ratio_medio": ratio_medio,
             "territori_conquistati": territori_conquistati,
-            "territori_persi": len(territori_persi),  # Stage A2: # netto territori persi nel turno
+            # Stage A2 fix: perdite calcolate fra fine turno scorso e inizio turno corrente
+            # (cattura attacchi subiti negli intermezzi).
+            "territori_persi": len(territori_persi_cross),
         }
         self.storia[colore].append(mossa)
 
@@ -121,7 +143,7 @@ class OpponentTracker:
                 "turno_avversario",
                 colore=colore,
                 attaccato=attaccato,
-                territori_persi=list(territori_persi),
+                territori_persi=list(territori_persi_cross),
                 territori_guadagnati=list(territori_guadagnati),
                 attacchi_contro_pov=attacchi_contro_pov,
             )

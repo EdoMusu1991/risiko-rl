@@ -303,6 +303,37 @@ A questo punto siamo a circa **45-65%** di win rate vs random. Il bot è **chiar
 
 ### Stage D — League play (Population-Based Training)
 
+#### Stage D semplificato 🟡 in test (training v8-selfplay)
+
+Implementazione minima del concetto: **invece di 16 policy in parallelo, 1 bot che si addestra contro copie precedenti di sé stesso**.
+
+Pipeline:
+1. **gen0** = baseline 500k (29% WR vs random)
+2. **gen1** = nuovo training, avversari campionati da [gen0]
+3. **gen2** = nuovo training, avversari campionati da [gen0, gen1] con bias verso recenti
+4. ... iterare finché gen N batte gen N-1 con WR > 50% in modo replicabile
+
+**Motivazione**: il bot vs random non scopre strategie psicologiche/sociali (cartina, balance of power, camuffamento obiettivo) perché random non reagisce. Self-play crea pressione strategica che fa emergere queste strategie.
+
+**Implementazione**:
+- `risiko_env/bot_rl_opponent.py` — adapter per usare modelli RL come avversari
+- `RisikoEnv(avversari={"ROSSO": modello_X, ...})` — supporta avversari custom
+- `notebooks/train_selfplay.ipynb` — training loop con campionamento dalla population
+- `scripts/self_play.py` — orchestratore: init, eval, tournament
+
+**Costi**:
+- 1M step per generazione (~50 min su T4)
+- 5-6 generazioni iniziali = ~5h totali = ~30 compute units
+- Validazione: scripts/self_play.py eval --vs gen0/genN/random
+
+**Criterio successo**:
+- gen N vs 3x gen N-1 → WR > 50% (mostra progresso)
+- gen N vs 3x random → WR ≥ 35% (non degrada vs baseline)
+- Tournament: gen più recenti vincono nel ranking
+- Test qualitativo: emergenza cartina, attacco al leader
+
+#### Stage D completo (futuro)
+
 **Cosa fa**: Invece di un bot che si addestra contro 3 random, addestriamo **8-16 policy in parallelo** con stili diversi:
 - Policy "aggressiva" (alta entropia, attacca spesso)
 - Policy "difensiva" (gioca conservativo, accumula armate)
