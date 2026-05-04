@@ -103,3 +103,49 @@ def visite_to_policy_full(
             policy[actions] = ns_t / ns_t.sum()
     
     return policy
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  PR2 — SEARCH SIMMETRICO
+# ═════════════════════════════════════════════════════════════════════════
+
+def search_simmetrico(
+    root: Node,
+    envs: dict,
+    net: RisikoNet,
+    n_simulations: int = 50,
+    c_puct: float = 1.5,
+    temperature: float = 1.0,
+    rng: Optional[np.random.Generator] = None,
+) -> tuple[int, list]:
+    """
+    Versione simmetrica di search() per AlphaZero puro (PR2).
+
+    Identica a search() ma chiama simulate_simmetrico (che usa due env templati
+    e gestisce correttamente i turni avversari come livelli MIN dell'albero).
+
+    Args:
+        root: Node radice. DEVE avere snapshot e player_to_move impostati,
+            e snapshot deve essere compatibile con envs[root.player_to_move].
+        envs: dict {"BLU": env_blu, "ROSSO": env_rosso}, entrambi con
+            _skip_giro_avversari=True. Verranno restorati allo stato della
+            root al termine.
+        net: RisikoNet usata per policy/value.
+        n_simulations: numero di simulazioni MCTS.
+        c_puct: coefficiente esplorazione PUCT.
+        temperature: 0=argmax, 1.0=sampling proporzionale.
+        rng: numpy random Generator (per riproducibilita').
+
+    Returns:
+        (action, dist) come search().
+    """
+    from .simulate import simulate_simmetrico
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    for _ in range(n_simulations):
+        simulate_simmetrico(root, envs, net, c_puct=c_puct)
+
+    action, dist = select_action_from_root(root, temperature=temperature, rng=rng)
+    return action, dist

@@ -9,13 +9,17 @@ NOTA SETTIMANA 6 — DUE FUNZIONI:
    euristico). Quindi raccoglie sample SOLO da BLU. Mantenuta per A/B test
    e backward-compat.
 
-2. gioca_partita_selfplay_simmetrica (PR1 fix simmetria): usa DUE env
-   templati (BLU e ROSSO) con stato e rng condivisi via re-aliasing al
-   cambio turno. Entrambi i colori passano per MCTS+rete -> sample BLU > 0
-   E sample ROSSO > 0. Limitato a mode_1v1=True.
+2. gioca_partita_selfplay_simmetrica: usa DUE env templati (BLU e ROSSO) con
+   stato e rng condivisi via re-aliasing al cambio turno. Entrambi i colori
+   passano per MCTS+rete -> sample BLU > 0 E sample ROSSO > 0. Limitato a
+   mode_1v1=True.
 
-NB: la simmetria DENTRO MCTS (simulate.py) e l'orientamento dell'observation
-rispetto al player_to_move sono affrontati nel PR2, separatamente.
+   - PR1 (Settimana 6): risolto self-play esterno. Raccolta sample
+     simmetrica.
+   - PR2 (Settimana 6): risolto MCTS interno tramite search_simmetrico /
+     simulate_simmetrico, che usano DUE env anche dentro il rollout MCTS.
+     Eliminato il bug "step() chiamato fuori turno bot" e il bug di segno
+     latente sulla observation orientata su bot_color.
 """
 
 from __future__ import annotations
@@ -274,13 +278,19 @@ def gioca_partita_selfplay_simmetrica(
             if policy_fn is not None:
                 action, policy_target = policy_fn(env_attivo, obs, info, T, rng)
             else:
+                # PR2: usa search_simmetrico con dict envs invece di search
+                # con env singolo. simulate_simmetrico gestisce i turni
+                # avversari come livelli MIN dell'albero (AlphaZero puro)
+                # invece di delegarli al bot interno dell'env.
+                from .search import search_simmetrico
+                envs_mcts = {"BLU": env_blu, "ROSSO": env_rosso}
                 root = Node(
                     snapshot=env_attivo.snapshot(),
                     player_to_move=player,
                     P=1.0,
                 )
-                action, _ = search(
-                    root, env_attivo, net,
+                action, _ = search_simmetrico(
+                    root, envs_mcts, net,
                     n_simulations=n_simulations,
                     c_puct=c_puct,
                     temperature=T,
