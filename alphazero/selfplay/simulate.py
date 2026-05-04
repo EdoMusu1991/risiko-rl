@@ -87,14 +87,19 @@ def simulate(
             info = env._costruisci_info()
             mask_np = info["action_mask"]
             
-            obs_t = torch.from_numpy(obs).float().unsqueeze(0)  # (1, 342)
-            mask_t = torch.from_numpy(mask_np).bool()           # (1765,)
+            # Sposta i tensori sullo stesso device della rete
+            net_device = next(net.parameters()).device
+            obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(net_device)
+            mask_t = torch.from_numpy(mask_np).bool().to(net_device)
             
             with torch.no_grad():
                 policy_logits, value_tensor = net(obs_t)
                 policy_dist = apply_mask_and_softmax(policy_logits[0], mask_t)
             
             value = float(value_tensor.item())  # scalar
+            
+            # Sposta policy_dist su CPU per accesso indicizzato veloce
+            policy_dist_cpu = policy_dist.cpu()
             
             # Espandi: crea TUTTI i figli per le azioni legali
             legal_actions = np.where(mask_np)[0].tolist()
@@ -114,7 +119,7 @@ def simulate(
                 child_player = env.stato.giocatore_corrente
                 
                 child = Node(
-                    P=float(policy_dist[action].item()),
+                    P=float(policy_dist_cpu[action].item()),
                     parent=node,
                     action_taken=int(action),
                     player_to_move=child_player,
