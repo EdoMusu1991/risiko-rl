@@ -209,3 +209,141 @@ def gioca_n_partite_parallele(
     stats_list = [r[2] for r in results]
 
     return samples_list, stats_list
+
+
+# ─────────────────────────────────────────────────────────────────
+#  EVAL: net (BLU) vs bot interno (default random) — anche parallelo
+# ─────────────────────────────────────────────────────────────────
+
+# Worker globals (riusiamo il pattern dei selfplay worker)
+_eval_worker_net: Optional[RisikoNet] = None
+
+
+def _eval_worker_init(state_dict_bytes: bytes, net_kwargs: dict) -> None:
+    """
+    Initializer per worker di valutazione.
+    Stesso del self-play: forza single-thread, ricostruisce la rete.
+    """
+    global _eval_worker_net
+
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    torch.set_num_threads(1)
+
+    state_dict = torch.load(
+        io.BytesIO(state_dict_bytes),
+        map_location="cpu",
+        weights_only=True,
+    )
+
+    net = RisikoNet(**net_kwargs)
+    net.load_state_dict(state_dict)
+    net.eval()
+    _eval_worker_net = net
+
+
+def _eval_worker_play_vs_random(args: tuple) -> tuple:
+    """
+    Una partita: rete (giocatore = bot_color) vs bot interno per gli altri.
+
+    In mode_1v1 + bot_color="BLU" + NON _skip_giro_avversari, l'env fa
+    giocare automaticamente ROSSO con bot_random ad ogni cambio turno.
+    Quindi il "nostro" bot affronta un random.
+
+    Usa gioca_partita_selfplay (legacy, non simmetrica): MCTS espande solo
+    nodi BLU, il bug PR2 sull'observation orientata su bot_color non si
+    manifesta perche' ROSSO non viene mai espanso in MCTS (lo gioca l'env).
+
+    Args:
+        args: (game_idx, seed, bot_color, n_simulations, max_decisioni, c_puct)
+
+    Returns:
+        (game_idx, stats)
+    """
+    global _eval_worker_net
+    assert _eval_worker_net is not None, "Worker non inizializzato"
+
+    game_idx, seed, bot_color, n_simulations, max_decisioni, c_puct = args
+
+    # Import lazy: questi moduli vengono importati per la prima volta nel worker
+    from risiko_env import RisikoEnv
+    from .self_play import gioca_partita_selfplay
+
+    env = RisikoEnv(bot_color=bot_color, mode_1v1=True, seed=seed)
+    _, stats = gioca_partita_selfplay(
+        env=env,
+        net=_eval_worker_net,
+        n_simulations=n_simulations,
+        c_puct=c_puct,
+        seed=seed,
+        max_decisioni=max_decisioni,
+    )
+    return (game_idx, stats)
+
+
+def gioca_n_partite_vs_random_parallele(
+    net: RisikoNet,
+    n_partite: int,
+    n_worker: int,
+    base_seed: int = 0,
+    *,
+    bot_color: str = "BLU",
+    n_simulations: int = 10,
+    max_decisioni: int = 1500,
+    c_puct: float = 1.5,
+    net_kwargs: Optional[dict] = None,
+    start_method: str = "spawn",
+) -> List[dict]:
+    """
+    Gioca n_partite "rete vs bot interno" in parallelo.
+
+    Per ogni partita: la rete gioca col colore `bot_color` (default BLU),
+    e l'altro colore (ROSSO in mode_1v1) e' giocato dal bot random
+    interno dell'env. Util per valutare una rete contro baseline random.
+
+    Args:
+        net: RisikoNet con cui giocare.
+        n_partite: numero totale di partite.
+        n_worker: processi worker.
+        base_seed: seed di base. Partita i usa seed=base_seed+i.
+        bot_color: colore controllato dalla rete ("BLU" o "ROSSO").
+        n_simulations, max_decisioni, c_puct: parametri MCTS.
+        net_kwargs: kwargs per costruire RisikoNet nei worker (default {}).
+        start_method: 'spawn' (default), 'fork', 'forkserver'.
+
+    Returns:
+        Lista di n_partite dict di statistiche, ordinata per game_idx.
+        Ogni stats ha 'vincitore' che e' "BLU"/"ROSSO"/None.
+    """
+    if n_partite <= 0:
+        raise ValueError(f"n_partite deve essere > 0, ricevuto {n_partite}")
+    if n_worker <= 0:
+        raise ValueError(f"n_worker deve essere > 0, ricevuto {n_worker}")
+    if n_worker > n_partite:
+        n_worker = n_partite
+    if bot_color not in ("BLU", "ROSSO"):
+        raise ValueError(f"bot_color deve essere BLU o ROSSO, ricevuto {bot_color}")
+
+    if net_kwargs is None:
+        net_kwargs = {}
+
+    buf = io.BytesIO()
+    torch.save(net.state_dict(), buf)
+    state_dict_bytes = buf.getvalue()
+
+    jobs = [
+        (i, base_seed + i, bot_color, n_simulations, max_decisioni, c_puct)
+        for i in range(n_partite)
+    ]
+
+    ctx = mp.get_context(start_method)
+
+    with ctx.Pool(
+        processes=n_worker,
+        initializer=_eval_worker_init,
+        initargs=(state_dict_bytes, net_kwargs),
+    ) as pool:
+        results = pool.map(_eval_worker_play_vs_random, jobs)
+
+    results.sort(key=lambda r: r[0])
+    return [r[1] for r in results]

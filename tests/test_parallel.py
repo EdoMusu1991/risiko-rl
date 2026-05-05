@@ -29,7 +29,10 @@ import torch
 import pytest
 
 from alphazero.network import RisikoNet
-from alphazero.selfplay import gioca_n_partite_parallele
+from alphazero.selfplay import (
+    gioca_n_partite_parallele,
+    gioca_n_partite_vs_random_parallele,
+)
 from alphazero.selfplay.self_play import gioca_partita_selfplay_simmetrica
 
 
@@ -222,6 +225,35 @@ def test_validazione_args():
 
 
 # ─────────────────────────────────────────────────────────────────
+#  TEST 7: eval vs random parallelo
+# ─────────────────────────────────────────────────────────────────
+
+def test_eval_vs_random_smoke():
+    """
+    Smoke test per gioca_n_partite_vs_random_parallele:
+    2 partite vs random in parallelo, niente crash, statistiche coerenti.
+    """
+    net = _new_net()
+
+    stats_list = gioca_n_partite_vs_random_parallele(
+        net=net, n_partite=2, n_worker=2, base_seed=9000,
+        bot_color="BLU",
+        n_simulations=3, max_decisioni=40, c_puct=1.5,
+    )
+
+    assert len(stats_list) == 2, f"Atteso 2 risultati, ricevuti {len(stats_list)}"
+    for i, st in enumerate(stats_list):
+        # Ogni stats deve avere almeno la chiave vincitore
+        assert "vincitore" in st, f"Partita {i}: stats senza 'vincitore'"
+        # vincitore puo' essere None (truncated) o BLU/ROSSO
+        assert st["vincitore"] in (None, "BLU", "ROSSO"), (
+            f"Partita {i}: vincitore inaspettato {st['vincitore']!r}"
+        )
+
+    print("[test_eval_vs_random_smoke] OK")
+
+
+# ─────────────────────────────────────────────────────────────────
 #  Runner standalone
 # ─────────────────────────────────────────────────────────────────
 
@@ -234,6 +266,7 @@ if __name__ == "__main__":
         test_determinismo,
         test_parita_con_sequenziale,
         test_validazione_args,
+        test_eval_vs_random_smoke,
     ]
     print(f"\nEseguo {len(tests)} test PR3 (parallel self-play)...\n")
     for t in tests:
