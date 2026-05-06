@@ -255,7 +255,8 @@ def _eval_worker_play_vs_random(args: tuple) -> tuple:
     manifesta perche' ROSSO non viene mai espanso in MCTS (lo gioca l'env).
 
     Args:
-        args: (game_idx, seed, bot_color, n_simulations, max_decisioni, c_puct)
+        args: (game_idx, seed, bot_color, n_simulations, max_decisioni, c_puct,
+               temperature_drop_step)
 
     Returns:
         (game_idx, stats)
@@ -263,7 +264,8 @@ def _eval_worker_play_vs_random(args: tuple) -> tuple:
     global _eval_worker_net
     assert _eval_worker_net is not None, "Worker non inizializzato"
 
-    game_idx, seed, bot_color, n_simulations, max_decisioni, c_puct = args
+    (game_idx, seed, bot_color, n_simulations, max_decisioni, c_puct,
+     temperature_drop_step) = args
 
     # Import lazy: questi moduli vengono importati per la prima volta nel worker
     from risiko_env import RisikoEnv
@@ -275,6 +277,7 @@ def _eval_worker_play_vs_random(args: tuple) -> tuple:
         net=_eval_worker_net,
         n_simulations=n_simulations,
         c_puct=c_puct,
+        temperature_drop_step=temperature_drop_step,
         seed=seed,
         max_decisioni=max_decisioni,
     )
@@ -291,6 +294,7 @@ def gioca_n_partite_vs_random_parallele(
     n_simulations: int = 10,
     max_decisioni: int = 1500,
     c_puct: float = 1.5,
+    temperature_drop_step: int = 0,
     net_kwargs: Optional[dict] = None,
     start_method: str = "spawn",
 ) -> List[dict]:
@@ -308,6 +312,12 @@ def gioca_n_partite_vs_random_parallele(
         base_seed: seed di base. Partita i usa seed=base_seed+i.
         bot_color: colore controllato dalla rete ("BLU" o "ROSSO").
         n_simulations, max_decisioni, c_puct: parametri MCTS.
+        temperature_drop_step: numero di decisioni iniziali con T=1.0
+            (azione campionata) prima di passare a T=0.0 (argmax).
+            Default 0 = sempre argmax, comportamento "eval / play to win".
+            Il default 30 di gioca_partita_selfplay e' pensato per
+            training, NON per eval (la rete gioca random per i primi 30
+            step e si autoaffossa).
         net_kwargs: kwargs per costruire RisikoNet nei worker (default {}).
         start_method: 'spawn' (default), 'fork', 'forkserver'.
 
@@ -332,7 +342,8 @@ def gioca_n_partite_vs_random_parallele(
     state_dict_bytes = buf.getvalue()
 
     jobs = [
-        (i, base_seed + i, bot_color, n_simulations, max_decisioni, c_puct)
+        (i, base_seed + i, bot_color, n_simulations, max_decisioni, c_puct,
+         temperature_drop_step)
         for i in range(n_partite)
     ]
 
@@ -344,6 +355,222 @@ def gioca_n_partite_vs_random_parallele(
         initargs=(state_dict_bytes, net_kwargs),
     ) as pool:
         results = pool.map(_eval_worker_play_vs_random, jobs)
+
+    results.sort(key=lambda r: r[0])
+    return [r[1] for r in results]
+
+
+# ─────────────────────────────────────────────────────────────────
+#  MATCH: net_blu vs net_rosso (eval inter-rete)
+# ─────────────────────────────────────────────────────────────────
+
+# Worker globals separate per i match (riesce a coesistere con eval_worker)
+_match_net_blu: Optional[RisikoNet] = None
+_match_net_rosso: Optional[RisikoNet] = None
+
+
+def _match_worker_init(
+    state_dict_blu_bytes: bytes,
+    state_dict_rosso_bytes: bytes,
+    net_kwargs: dict,
+) -> None:
+    """
+    Initializer per worker di match: carica DUE reti, una per BLU e una per ROSSO.
+    """
+    global _match_net_blu, _match_net_rosso
+
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    torch.set_num_threads(1)
+
+    sd_b = torch.load(io.BytesIO(state_dict_blu_bytes), map_location="cpu",
+                      weights_only=True)
+    sd_r = torch.load(io.BytesIO(state_dict_rosso_bytes), map_location="cpu",
+                      weights_only=True)
+
+    nb = RisikoNet(**net_kwargs)
+    nb.load_state_dict(sd_b)
+    nb.eval()
+    _match_net_blu = nb
+
+    nr = RisikoNet(**net_kwargs)
+    nr.load_state_dict(sd_r)
+    nr.eval()
+    _match_net_rosso = nr
+
+
+def _match_worker_play(args: tuple) -> tuple:
+    """
+    Una partita: net_blu (gioca BLU) vs net_rosso (gioca ROSSO).
+
+    Replica la logica di gioca_partita_selfplay_simmetrica (PR2) ma sceglie
+    dinamicamente la rete in base al player corrente. La sincronizzazione fra
+    i due env (BLU e ROSSO con _skip_giro_avversari=True) avviene quando il
+    turno finisce (sotto_fase=None) — vedi self_play.py:329 per il pattern.
+
+    Args:
+        args: (game_idx, seed, n_simulations, max_decisioni, c_puct, temperature)
+
+    Returns:
+        (game_idx, dict_stats)
+    """
+    global _match_net_blu, _match_net_rosso
+    assert _match_net_blu is not None and _match_net_rosso is not None
+
+    game_idx, seed, n_simulations, max_decisioni, c_puct, temperature = args
+
+    # Import lazy nel worker
+    import numpy as np
+    from risiko_env import RisikoEnv
+    from .node import Node
+    from .search import search_simmetrico
+
+    # Due env con _skip_giro_avversari (set after construction, non e' kwarg)
+    env_blu = RisikoEnv(bot_color="BLU", mode_1v1=True, seed=seed)
+    env_blu._skip_giro_avversari = True
+    env_rosso = RisikoEnv(bot_color="ROSSO", mode_1v1=True, seed=seed)
+    env_rosso._skip_giro_avversari = True
+
+    obs_b, info_b = env_blu.reset(seed=seed)
+    obs_r, info_r = env_rosso.reset(seed=seed)
+
+    rng = np.random.default_rng(seed)
+    envs = {"BLU": env_blu, "ROSSO": env_rosso}
+    nets = {"BLU": _match_net_blu, "ROSSO": _match_net_rosso}
+
+    # Inizio partita: BLU muove per primo (mode_1v1)
+    env_attivo = env_blu
+    obs, info = obs_b, info_b
+
+    n_decisioni = 0
+    n_decisioni_mcts = 0
+    n_decisioni_forced = 0
+
+    while n_decisioni < max_decisioni:
+        mask = info["action_mask"]
+        n_legali = int(mask.sum())
+        if n_legali == 0:
+            break
+
+        if n_legali == 1:
+            azione = int(np.where(mask)[0][0])
+            n_decisioni_forced += 1
+        else:
+            player = env_attivo.bot_color
+            root = Node(
+                snapshot=env_attivo.snapshot(),
+                player_to_move=player,
+                P=1.0,
+            )
+            azione, _ = search_simmetrico(
+                root, envs, nets[player],
+                n_simulations=n_simulations,
+                c_puct=c_puct,
+                temperature=temperature,
+                rng=rng,
+            )
+            n_decisioni_mcts += 1
+
+        # Step SOLO sull'env attivo (l'altro non puo' eseguire step fuori turno)
+        obs, _, term, trunc, info = env_attivo.step(int(azione))
+        n_decisioni += 1
+
+        if term or trunc:
+            break
+
+        # Cambio env quando il turno e' finito (vedi PR2 self_play.py:329)
+        if env_attivo.sotto_fase is None:
+            env_passivo = env_rosso if env_attivo is env_blu else env_blu
+            # Re-alias dello stato (deepcopy in restore() puo' aver creato nuovi obj)
+            env_passivo.stato = env_attivo.stato
+            env_passivo.rng = env_attivo.rng
+            env_passivo._inizia_fase_tris()
+            env_attivo = env_passivo
+            obs = env_attivo._costruisci_observation()
+            info = env_attivo._costruisci_info()
+
+    vincitore = env_attivo.stato.vincitore
+    stats = {
+        "vincitore": vincitore,
+        "terminata": bool(env_attivo.stato.terminata),
+        "n_decisioni_totale": n_decisioni,
+        "n_decisioni_mcts": n_decisioni_mcts,
+        "n_decisioni_forced": n_decisioni_forced,
+    }
+    return (game_idx, stats)
+
+
+def gioca_n_partite_match_parallele(
+    net_blu: RisikoNet,
+    net_rosso: RisikoNet,
+    n_partite: int,
+    n_worker: int,
+    base_seed: int = 0,
+    *,
+    n_simulations: int = 10,
+    max_decisioni: int = 1500,
+    c_puct: float = 1.5,
+    temperature: float = 0.3,
+    net_kwargs: Optional[dict] = None,
+    start_method: str = "spawn",
+) -> List[dict]:
+    """
+    Match parallelo tra due reti. net_blu gioca BLU, net_rosso gioca ROSSO.
+
+    Per round-robin con colori invertiti, chiama questa funzione due volte:
+        stats_a_blu = gioca_n_partite_match_parallele(net_a, net_b, n=20, ...)
+        stats_b_blu = gioca_n_partite_match_parallele(net_b, net_a, n=20, ...)
+    Poi conta le vittorie di net_a in entrambi i set.
+
+    Usa search_simmetrico (PR2) per qualita' MCTS corretta in entrambi i lati.
+
+    Args:
+        net_blu: rete che gioca BLU.
+        net_rosso: rete che gioca ROSSO.
+        n_partite: numero totale di partite.
+        n_worker: processi worker.
+        base_seed: seed di base. Partita i usa seed=base_seed+i.
+        n_simulations, max_decisioni, c_puct: parametri MCTS.
+        temperature: 0=argmax (rischio collasso con reti deboli),
+            0.3 raccomandato per eval generazionale, 1.0 esplorativo.
+        net_kwargs: kwargs per costruire RisikoNet nei worker (default {}).
+        start_method: 'spawn' (default).
+
+    Returns:
+        Lista di n_partite dict di statistiche, ordinata per game_idx.
+    """
+    if n_partite <= 0:
+        raise ValueError(f"n_partite deve essere > 0, ricevuto {n_partite}")
+    if n_worker <= 0:
+        raise ValueError(f"n_worker deve essere > 0, ricevuto {n_worker}")
+    if n_worker > n_partite:
+        n_worker = n_partite
+
+    if net_kwargs is None:
+        net_kwargs = {}
+
+    # Serializza entrambi gli state_dict
+    buf_b = io.BytesIO()
+    torch.save(net_blu.state_dict(), buf_b)
+    sd_b = buf_b.getvalue()
+
+    buf_r = io.BytesIO()
+    torch.save(net_rosso.state_dict(), buf_r)
+    sd_r = buf_r.getvalue()
+
+    jobs = [
+        (i, base_seed + i, n_simulations, max_decisioni, c_puct, temperature)
+        for i in range(n_partite)
+    ]
+
+    ctx = mp.get_context(start_method)
+
+    with ctx.Pool(
+        processes=n_worker,
+        initializer=_match_worker_init,
+        initargs=(sd_b, sd_r, net_kwargs),
+    ) as pool:
+        results = pool.map(_match_worker_play, jobs)
 
     results.sort(key=lambda r: r[0])
     return [r[1] for r in results]

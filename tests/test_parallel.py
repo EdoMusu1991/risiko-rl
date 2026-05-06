@@ -32,6 +32,7 @@ from alphazero.network import RisikoNet
 from alphazero.selfplay import (
     gioca_n_partite_parallele,
     gioca_n_partite_vs_random_parallele,
+    gioca_n_partite_match_parallele,
 )
 from alphazero.selfplay.self_play import gioca_partita_selfplay_simmetrica
 
@@ -254,6 +255,36 @@ def test_eval_vs_random_smoke():
 
 
 # ─────────────────────────────────────────────────────────────────
+#  TEST 8: match net_blu vs net_rosso parallelo
+# ─────────────────────────────────────────────────────────────────
+
+def test_match_due_reti_smoke():
+    """
+    Smoke test per gioca_n_partite_match_parallele:
+    2 partite con due reti, niente crash, statistiche coerenti.
+    """
+    net_a = _new_net(seed=1)
+    net_b = _new_net(seed=2)
+
+    stats_list = gioca_n_partite_match_parallele(
+        net_blu=net_a, net_rosso=net_b,
+        n_partite=2, n_worker=2, base_seed=8000,
+        n_simulations=3, max_decisioni=40, c_puct=1.5,
+        temperature=0.3,
+    )
+
+    assert len(stats_list) == 2, f"Atteso 2 risultati, ricevuti {len(stats_list)}"
+    for i, st in enumerate(stats_list):
+        assert "vincitore" in st
+        assert st["vincitore"] in (None, "BLU", "ROSSO"), (
+            f"Partita {i}: vincitore inaspettato {st['vincitore']!r}"
+        )
+        assert st["n_decisioni_totale"] > 0
+
+    print("[test_match_due_reti_smoke] OK")
+
+
+# ─────────────────────────────────────────────────────────────────
 #  Runner standalone
 # ─────────────────────────────────────────────────────────────────
 
@@ -267,6 +298,7 @@ if __name__ == "__main__":
         test_parita_con_sequenziale,
         test_validazione_args,
         test_eval_vs_random_smoke,
+        test_match_due_reti_smoke,
     ]
     print(f"\nEseguo {len(tests)} test PR3 (parallel self-play)...\n")
     for t in tests:
