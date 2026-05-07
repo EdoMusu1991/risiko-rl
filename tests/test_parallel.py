@@ -285,6 +285,36 @@ def test_match_due_reti_smoke():
 
 
 # ─────────────────────────────────────────────────────────────────
+#  TEST 9: match con n_sim alto — esercita edge case terminale
+# ─────────────────────────────────────────────────────────────────
+
+def test_match_n_sim_alto_no_assert():
+    """
+    Regression test per il bug "AssertionError: Caso non previsto: terminale
+    con cambio giocatore" in simulate_simmetrico (riga 412 originale).
+    Con due reti diverse e n_sim relativamente alto, MCTS esplora rami con
+    esiti terminali in cui giocatore_corrente cambia tra parent e child.
+    La fix (sostituzione assert con flip-segno corretto) deve permettere
+    al match di completare senza errori.
+    """
+    net_a = _new_net(seed=10)
+    net_b = _new_net(seed=20)
+
+    # 2 partite con n_sim=20 — basta a esercitare l'edge case su seeds variati
+    stats_list = gioca_n_partite_match_parallele(
+        net_blu=net_a, net_rosso=net_b,
+        n_partite=2, n_worker=2, base_seed=70000,
+        n_simulations=20, max_decisioni=80, c_puct=1.5,
+        temperature=0.3,
+    )
+    assert len(stats_list) == 2
+    for st in stats_list:
+        assert "vincitore" in st
+
+    print("[test_match_n_sim_alto_no_assert] OK")
+
+
+# ─────────────────────────────────────────────────────────────────
 #  Runner standalone
 # ─────────────────────────────────────────────────────────────────
 
@@ -299,6 +329,7 @@ if __name__ == "__main__":
         test_validazione_args,
         test_eval_vs_random_smoke,
         test_match_due_reti_smoke,
+        test_match_n_sim_alto_no_assert,
     ]
     print(f"\nEseguo {len(tests)} test PR3 (parallel self-play)...\n")
     for t in tests:

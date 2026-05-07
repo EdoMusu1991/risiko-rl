@@ -399,21 +399,22 @@ def simulate_simmetrico(
 
                 if term or trunc or env_attivo.stato.terminata:
                     child.is_terminal = True
-                    # terminal_value: e' il reward dell'ultimo step. Reward e'
-                    # dal POV di env_attivo.bot_color (quello che ha fatto step,
-                    # = parent.player_to_move = snap_node_color). Per il backup
-                    # usiamo player_leaf=child.player_to_move, che potrebbe
-                    # essere diverso. Quindi convertiamo: se child_player ==
-                    # snap_node_color, va bene; altrimenti flip.
+                    # terminal_value: il reward e' dal POV di env_attivo.bot_color
+                    # (chi ha fatto step, = parent.player_to_move = snap_node_color).
+                    # Per il backup useremo player_leaf=child.player_to_move.
+                    # Se child_player == snap_node_color: stesso POV, valore diretto.
+                    # Se child_player != snap_node_color: POV opposto, flip segno.
                     #
-                    # In pratica in 1v1, su step terminale stato.giocatore_corrente
-                    # NON cambia (avanza_turno saltato), quindi child_player ==
-                    # snap_node_color sempre. Lasciamo l'assert per sicurezza.
-                    assert child_player == snap_node_color, (
-                        f"Caso non previsto: terminale con cambio giocatore "
-                        f"(snap_node_color={snap_node_color}, child={child_player})"
-                    )
-                    child.terminal_value = float(reward)
+                    # NB: il caso "child_player != snap_node_color su step terminale"
+                    # NON si verifica in self_play simmetrica (giocatore_corrente non
+                    # cambia in termina_partita_per_*) ma si presenta nel match
+                    # parallelo con due reti diverse (gioca_n_partite_match_parallele)
+                    # quando MCTS esplora rami con esiti edge-case. Il flip rende il
+                    # MCTS corretto in entrambi i casi.
+                    if child_player == snap_node_color:
+                        child.terminal_value = float(reward)
+                    else:
+                        child.terminal_value = -float(reward)
 
                 node.children[int(action)] = child
 
